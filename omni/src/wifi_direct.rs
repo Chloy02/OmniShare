@@ -95,7 +95,7 @@ impl WpaClient {
             .context("Failed to execute busctl call Find")?;
 
         if status.success() {
-            println!("✅ P2P Scan started (DBus).");
+            println!("P2P Scan started (DBus).");
             Ok(())
         } else {
             Err(anyhow!("Failed to start P2P scan via DBus"))

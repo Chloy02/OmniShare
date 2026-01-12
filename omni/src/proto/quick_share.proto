@@ -1,0 +1,90 @@
+syntax = "proto2";
+
+package location.nearby.connections;
+
+option java_outer_classname = "OfflineWireFormats";
+option optimize_for = LITE_RUNTIME;
+
+// The root container for all Quick Share messages.
+message OfflineFrame {
+  optional int32 version = 1 [default = 1];
+  
+  // The different types of messages we might receive.
+  optional V1Frame v1 = 2;
+}
+
+message V1Frame {
+  enum FrameType {
+    UNKNOWN_FRAME_TYPE = 0;
+    CONNECTION_REQUEST = 1;
+    CONNECTION_RESPONSE = 2;
+    PAYLOAD_TRANSFER = 3;
+    BANDWIDTH_UPGRADE_NEGOTIATION = 4;
+    KEEP_ALIVE = 5;
+    DISCONNECTION = 6;
+    PAIRED_KEY_ENCRYPTION = 7;
+  }
+
+  optional FrameType type = 1;
+
+  optional ConnectionRequest connection_request = 2;
+  optional ConnectionResponse connection_response = 3;
+  optional PayloadTransfer payload_transfer = 4;
+  optional BandwidthUpgradeNegotiation bandwidth_upgrade_negotiation = 5;
+  optional KeepAlive keep_alive = 6;
+  optional Disconnection disconnection = 7;
+  optional PairedKeyEncryption paired_key_encryption = 8;
+}
+
+message ConnectionRequest {
+  optional string endpoint_id = 1;
+  optional string endpoint_name = 2;
+  optional string endpoint_info = 3; // The raw bytes including Device Type info
+  optional int32 nonce = 4;
+  optional bytes handshake_data = 5; // The UKEY2 Client Init message
+}
+
+message ConnectionResponse {
+  enum Status {
+    UNKNOWN = 0;
+    ACCEPT = 1;
+    REJECT = 2;
+  }
+  optional int32 status = 1; 
+  optional bytes handshake_data = 2; // The UKEY2 Server Init message
+}
+
+message PayloadTransfer {
+  optional int64 payload_id = 1;
+  optional PacketType packet_type = 2;
+  optional int64 total_bytes = 3;
+  optional int64 payload_chunk_offset = 4;
+  optional bytes payload_chunk = 5;
+  
+  enum PacketType {
+    UNKNOWN = 0;
+    DATA = 1;
+    FILE = 2;
+  }
+}
+
+message BandwidthUpgradeNegotiation {
+   enum EventType {
+     UNKNOWN = 0;
+     UPGRADE_PATH_AVAILABLE = 1;
+     UPGRADE_FAILURE = 2;
+   }
+   optional EventType event_type = 1; 
+}
+
+message KeepAlive {
+  optional bool ack = 1;
+}
+
+message Disconnection {
+  optional bool request_safe_to_disconnect = 1; 
+}
+
+message PairedKeyEncryption {
+  optional bytes signed_data = 1;
+}

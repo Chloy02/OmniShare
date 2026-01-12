@@ -1,4 +1,8 @@
 mod wifi_direct;
+mod discovery;
+mod protocol;
+
+
 use clap::{Parser, Subcommand};
 use wifi_direct::WpaClient;
 use std::thread;
@@ -15,15 +19,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scan for nearby devices
+    /// Scan for nearby devices (WiFi Direct)
     Scan {
         /// Network interface to use (auto-detects if not specified)
         #[arg(short, long)]
         interface: Option<String>,
     },
+    /// Scan for Quick Share devices (BLE)
+    ScanBle,
+    /// Test UKEY2 Crypto Handshake (Debug)
+    TestHandshake,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
@@ -34,7 +43,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| "wlan0".to_string()),
             };
 
-            println!("🔗 OmniShare - Scanning on {}...", iface_name);
+            println!("OmniShare - Scanning on {}...", iface_name);
             let client = WpaClient::new(&iface_name).context("Failed to initialize DBus client")?;
             
             // Start scan
@@ -47,11 +56,31 @@ fn main() -> anyhow::Result<()> {
             if peers.is_empty() {
                 println!("No peers found yet. (Ensure Android 'Nearby Share' or 'WiFi Direct' is visible)");
             } else {
-                println!("📡 Found {} peers:", peers.len());
+                println!("Found {} peers:", peers.len());
                 for peer in peers {
                     println!("  - {}", peer);
                 }
             }
+        },
+        Commands::ScanBle => {
+            println!("Starting Quick Share BLE Discovery (Service: 0xFEF3)...");
+            discovery::ble::scan_for_quick_share().await?;
+        },
+        Commands::TestHandshake => {
+            println!("Initializing UKEY2 Secure Session...");
+            use protocol::ukey2_engine::Ukey2Session;
+            
+            let session = Ukey2Session::new()?;
+            println!("Curve25519 Key Pair Generated.");
+            
+            let client_init = session.generate_client_init();
+            println!("Generated ClientInit Message:");
+            println!("   - Version: {:?}", client_init.version);
+            println!("   - Random (Nonce): {} bytes", client_init.random.as_ref().map(|r| r.len()).unwrap_or(0));
+            println!("   - Next Protocol: {:?}", client_init.next_protocol);
+            println!("   - Cipher Commitments: {:?}", client_init.cipher_commitments);
+            
+            println!("Crypto Engine is Ready!");
         }
     }
     Ok(())

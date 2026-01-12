@@ -1,0 +1,54 @@
+syntax = "proto2";
+
+package securegcm;
+
+option java_outer_classname = "Ukey2";
+
+enum Ukey2HandshakeCipher {
+  RESERVED = 0;
+  P256_SHA512 = 100;
+  CURVE25519_SHA512 = 200;
+}
+
+message Ukey2Message {
+  enum Type {
+    UNKNOWN_DO_NOT_USE = 0;
+    ALERT = 1;
+    CLIENT_INIT = 2;
+    SERVER_INIT = 3;
+    CLIENT_FINISHED = 4;
+  }
+
+  optional Type message_type = 1;
+  optional bytes message_data = 2;
+}
+
+message Ukey2ClientInit {
+  optional int32 version = 1;
+  optional bytes random = 2;
+
+  // The next_protocol string is "AES_256_CBC-HMAC_SHA256" typically
+  optional string next_protocol = 3; 
+
+  repeated Ukey2HandshakeCipher cipher_commitments = 4;
+}
+
+message Ukey2ServerInit {
+  optional int32 version = 1;
+  optional bytes random = 2;
+  optional Ukey2HandshakeCipher handshake_cipher = 3;
+  optional bytes public_key = 4;
+}
+
+message Ukey2ClientFinished {
+  optional bytes public_key = 1;
+}
+
+message Ukey2Alert {
+  enum Type {
+    BAD_MESSAGE = 1;
+    BAD_MAC = 2;
+  }
+  optional Type type = 1;
+  optional string error_message = 2;
+}
