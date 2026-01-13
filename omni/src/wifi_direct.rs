@@ -120,8 +120,7 @@ impl WpaClient {
             .context("Failed to get Peers property")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut results = Vec::new();
-
+        
         // Parse object paths. Format: ao 2 "/path/1" "/path/2"
         // We look for strings starting with "/fi/w1/..." inside quotes.
         let paths: Vec<&str> = stdout
@@ -129,6 +128,7 @@ impl WpaClient {
             .filter(|s| s.starts_with("/fi/w1/wpa_supplicant1/Interfaces"))
             .collect();
 
+        let mut results = Vec::new();
         for peer_path in paths {
             // Get properties for this peer
             // DeviceName, Manufacturer, ModelName
@@ -140,6 +140,34 @@ impl WpaClient {
         }
             
         Ok(results)
+    }
+
+    /// Connect to a peer using PBC (Push Button) or PIN method.
+    /// For this phase, we use "pbc" (Push Button Configuration) or "display" which is common for Quick Share.
+    pub fn p2p_connect(&self, peer_addr: &str) -> Result<()> {
+        let peer_path = format!("{}/Peers/{}", self.dbus_path, peer_addr.replace(":", "_"));
+        
+        println!("Calling P2PConnect on {}", peer_path);
+
+        let status = Command::new("busctl")
+            .args([
+                "call", 
+                "fi.w1.wpa_supplicant1", 
+                &self.dbus_path, 
+                "fi.w1.wpa_supplicant1.Interface.P2PDevice", 
+                "GroupAdd", // Start Group Formation
+                "a{sv}", 
+                "0"
+            ])
+            .status()
+            .context("Failed to execute GroupAdd")?;
+
+        if status.success() {
+             println!("Group Formation Initiated.");
+             Ok(())
+        } else {
+             Err(anyhow!("Failed to initiate P2P Group"))
+        }
     }
 
     fn get_peer_property(path: &str, prop: &str) -> Option<String> {

@@ -18,7 +18,7 @@ pub async fn scan_for_quick_share() -> Result<()> {
 
     // start scanning for devices
     central.start_scan(ScanFilter::default()).await?;
-    println!("📡 Scanning for Quick Share devices (Service UUID: {:?})...", QUICK_SHARE_SERVICE_UUID);
+    println!("Scanning for Quick Share devices (Service UUID: {:?})...", QUICK_SHARE_SERVICE_UUID);
 
     // Using a stream to handle events is more robust for async
     let mut events = central.events().await?;
@@ -35,11 +35,10 @@ pub async fn scan_for_quick_share() -> Result<()> {
                 btleplug::api::CentralEvent::DeviceUpdated(id) => {
                     if let Ok(device) = central.peripheral(&id).await {
                         if let Ok(Some(props)) = device.properties().await {
-                             // Check if the device advertises the Quick Share Service UUID
-                             if props.services.contains(&QUICK_SHARE_SERVICE_UUID) {
-                                let local_name = props.local_name.unwrap_or_else(|| "Unknown".to_string());
-                                println!("✨ Found Quick Share Device!");
-                                println!("   - Name: {}", local_name);
+                            // Check if the device advertises the Quick Share Service UUID
+                             if props.services.contains(&QUICK_SHARE_SERVICE_UUID) || props.service_data.contains_key(&QUICK_SHARE_SERVICE_UUID) {
+                                println!("Found Quick Share Device!");
+                                println!("   - Name: {}", props.local_name.as_deref().unwrap_or("Unknown"));
                                 println!("   - ID: {:?}", id);
                                 println!("   - RSSI: {:?}", props.rssi);
                                 

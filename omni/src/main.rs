@@ -1,6 +1,7 @@
 mod wifi_direct;
 mod discovery;
 mod protocol;
+mod connection_manager;
 
 
 use clap::{Parser, Subcommand};
@@ -29,6 +30,12 @@ enum Commands {
     ScanBle,
     /// Test UKEY2 Crypto Handshake (Debug)
     TestHandshake,
+    /// Connect to a Quick Share Device
+    Connect {
+        /// Network interface to use (auto-detects if not specified)
+        #[arg(short, long)]
+        interface: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -81,6 +88,14 @@ async fn main() -> anyhow::Result<()> {
             println!("   - Cipher Commitments: {:?}", client_init.cipher_commitments);
             
             println!("Crypto Engine is Ready!");
+        },
+        Commands::Connect { interface } => {
+            let iface_name = match interface {
+                Some(i) => i.clone(),
+                None => WpaClient::auto_detect_interface()
+                    .unwrap_or_else(|| "wlan0".to_string()),
+            };
+            connection_manager::ConnectionManager::initiate_connection(&iface_name).await?;
         }
     }
     Ok(())
