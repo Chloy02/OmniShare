@@ -1,19 +1,22 @@
 [package]
 name = "omni"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-anyhow = "1.0.100"
-clap = { version = "4.5.54", features = ["derive"] }
-tokio = { version = "1.49.0", features = ["full"] }
-btleplug = "0.11"
-uuid = "1.0"
-futures = "0.3"
-prost = "0.13"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.36", features = ["full"] }
+# System Integration
+bluer = { version = "0.17", features = ["bluetoothd"] }
+zbus = { version = "4.0", features = ["tokio"] }
+# Crypto & Utils
 ring = "0.17"
 rand = "0.8"
 hex = "0.4"
+uuid = "1.0"
+prost = "0.12"
+futures = "0.3"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.12"

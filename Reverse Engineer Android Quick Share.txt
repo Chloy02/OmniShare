@@ -1,0 +1,296 @@
+﻿Engineering a Native Linux Bridge for the Android Quick Share Ecosystem: A Comprehensive Reverse Engineering and Implementation Study
+Executive Summary
+The fragmentation between mobile and desktop operating systems creates significant friction in user workflows, particularly regarding file transfer and clipboard synchronization. While proprietary ecosystems like Apple’s AirDrop provide seamless, zero-configuration interoperability, the Linux desktop environment lacks a native, "client-less" equivalent for the Android ecosystem. The user’s objective—to engineer a Linux application capable of interfacing directly with Android’s "Quick Share" (formerly Nearby Share) without requiring a companion Android app—represents a formidable challenge in protocol reverse engineering, systems programming, and cryptographic implementation.
+This report serves as an exhaustive technical blueprint for constructing such a bridge using the Rust programming language on a Fedora Linux environment. It dissects the Quick Share protocol’s multi-layered architecture, analyzing the mechanisms of Bluetooth Low Energy (BLE) discovery, Multicast DNS (mDNS) visibility, UKEY2 (User Key Exchange v2) authentication, and the complex negotiation of transport upgrades from standard WLAN to Wi-Fi Direct (P2P).
+The analysis reveals that while current open-source implementations like NearDrop and rquickshare have successfully bridged the LAN-based gap, the "offline" direct connection capability remains largely unimplemented due to the intricacies of Linux’s Wi-Fi P2P stack. This report provides a novel architectural strategy for overcoming these limitations by leveraging the NetworkManager D-Bus API and Rust’s asynchronous ecosystem to replicate Android’s P2P handshake. It concludes that a Rust-based solution, utilizing crates such as bluer, zbus, and prost, offers the optimal balance of memory safety, performance, and system-level integration required to emulate a certified Android endpoint.
+1. Introduction: The Imperative for Client-Less Interoperability
+The evolution of local data sharing protocols has been driven by the need for speed, security, and ease of use. For Linux users, the landscape has historically been populated by solutions requiring software installation on both ends—tools like KDE Connect or Warpinator. While functional, these solutions fail the "coffee shop test": sharing a file with a stranger or a guest who cannot or will not install a specific app. The "client-less" requirement mandates that the Linux application must speak the native language of the Android operating system, effectively spoofing a Google-certified device.
+1.1. The Evolution from Android Beam to Quick Share
+The trajectory of Android’s local sharing protocols highlights a shift from hardware-specific implementations to software-defined, multi-transport adaptability.
+* Android Beam (Deprecated): Relied on Near Field Communication (NFC) to bootstrap a Bluetooth connection. It was simple but slow and required physical contact.
+* Nearby Share (GMS): Introduced as part of Google Mobile Services, this protocol decoupled discovery from transport. It utilizes Bluetooth Low Energy (BLE) for proximity detection and can upgrade the connection to WebRTC, WLAN (LAN), or Wi-Fi Direct depending on network availability and file size.1
+* Quick Share (Unified): In early 2024, Google and Samsung merged their respective sharing protocols under the "Quick Share" banner.3 This unification implies that a robust Linux client must not only handle the standard Google protocol but potentially negotiate Samsung-specific extensions or fallback modes to ensure broad compatibility.
+1.2. The Linux Compatibility Gap
+Current state-of-the-art implementations on desktop platforms, such as NearDrop for macOS and rquickshare for Linux, primarily operate over the Wi-Fi LAN transport medium.1 This means both devices must be connected to the same Wi-Fi router. This limitation is significant:
+1. Public Networks: On networks with "Client Isolation" (e.g., airports, universities), mDNS broadcast packets are blocked, rendering devices invisible to each other.
+2. No Internet: In scenarios without a router, LAN-based sharing is impossible.
+The "Holy Grail" of this project is to implement the Wi-Fi Direct (P2P) transport layer on Linux. This allows the Android device to connect directly to the Linux laptop's Wi-Fi card, creating an ad-hoc high-speed link independent of any infrastructure. Achieving this requires a deep dive into the Linux network stack, specifically the interaction between wpa_supplicant, NetworkManager, and the kernel's wireless subsystems.5
+1.3. Development Environment and Toolchain
+The choice of Fedora Linux and Rust is strategic.
+* Fedora: As an upstream-first distribution, Fedora provides the latest kernels and software stacks (BlueZ, NetworkManager, PipeWire). However, it also enforces strict security policies via SELinux and Firewalld, which present unique challenges for an application that essentially acts as a network server and P2P group owner.7
+* Rust: The language’s guarantee of memory safety without a garbage collector makes it ideal for handling binary protocols, raw socket manipulation, and complex D-Bus inter-process communication (IPC). The Rust ecosystem for Linux system programming (zbus, bluer, netlink) has matured significantly, enabling safe abstractions over C-based APIs.9
+________________
+2. Protocol Architecture: The Discovery Layer
+The Quick Share protocol functions as a funnel, moving devices from a low-power, low-bandwidth discovery state to a high-power, secure, high-bandwidth transfer state. The first stage of this funnel is Discovery. To be "client-less," the Linux app must be visible to Android's background scanners.
+2.1. Bluetooth Low Energy (BLE) Advertisement
+Android devices constantly scan for BLE packets to detect nearby sharing targets. When a user opens the "Quick Share" sheet, their device switches to a high-duty scanning mode. For the Linux machine to appear in this list, it must broadcast a carefully constructed BLE advertisement.
+2.1.1. The Advertisement Payload Structure
+Research into the protocol indicates that Quick Share uses specific Service UUIDs to identify itself. The Linux application, acting as a BLE Peripheral, must register an advertisement containing these IDs.
+* Fast Pair Service (0xFE2C): Often associated with initial pairing of accessories (headphones), this service UUID is also utilized in the handshake process for device recognition.11
+* Nearby Sharing Service (0xFC9F): This is the primary identifier for the file-sharing protocol. The presence of 0xFC9F in the Service UUID list is the trigger for the Android UI to display a "Device Nearby" notification.1
+The payload associated with 0xFC9F is non-trivial. It is not static; it contains encrypted metadata about the device's identity and visibility settings.
+* Service Data Header: The payload typically begins with a length byte and the type 0x16 (Service Data - 16-bit UUID).
+* Endpoint ID: A 4-byte random alphanumeric string that identifies the session. This ID must persist for the duration of the app's runtime to prevent the device from flickering in the user list.1
+* Device Identity Hash: To support "Contacts Only" visibility, the payload contains a truncated SHA-256 hash of the user's account certificate. For a generic "Everyone" visibility mode (which the Linux app will likely implement initially), this field uses a specific "null" or "anonymous" salt that tells the scanning device to show the generic icon.1
+2.1.2. Linux Implementation with BlueZ and bluer
+On Fedora, the Bluetooth stack is managed by BlueZ. The Rust application cannot talk to the Bluetooth controller directly (e.g., via HCISocket) without interfering with the system's bluetooth daemon. Instead, it must use the BlueZ D-Bus API org.bluez.LEAdvertisement1.
+The bluer crate provides a safe Rust wrapper for this API.
+* Implementation Strategy: The app must instantiate a bluer::Session, verify the adapter is powered on, and then register an Advertisement.
+* Critical Constraint: The Linux Bluetooth controller must support Peripheral Mode and Extended Advertising (for newer protocol versions). Some older laptop chipsets may struggle with maintaining a stable advertisement while simultaneously scanning or maintaining a Classic Bluetooth connection (e.g., to a mouse).14
+Table 1: BLE Advertisement Packet Composition for Quick Share
+Field
+	Length
+	Value / Description
+	Flags
+	1 byte
+	0x06 (General Discoverable Mode + BR/EDR Not Supported).
+	Length
+	1 byte
+	Length of Service Data.
+	Type
+	1 byte
+	0x16 (Service Data - 16-bit UUID).
+	UUID
+	2 bytes
+	0x9F 0xFC (Little Endian for 0xFC9F).
+	Payload
+	Variable
+	[Version (3 bits)][Visibility (1 bit)] + + + [Encrypted Name Metadata].
+	Insight: The "Device Type" bits in the payload determine the icon shown on Android (Phone, Tablet, Computer). The Linux app must correctly set these bits to Computer to appear with the correct glyph.
+2.2. Multicast DNS (mDNS) Visibility
+While BLE is used for proximity, mDNS (Bonjour/Avahi) is the primary discovery mechanism when devices are on the same Wi-Fi network. This allows for immediate, high-speed connection establishment without the latency of Bluetooth negotiation.
+2.2.1. The mDNS Service Record
+The Android implementation listens for a service type _FC9F5ED42C8A._tcp.1 The cryptic name is likely a hash of the string "NearbySharing".
+* Port: The application must bind a TCP port (e.g., 56789) and publish it in the SRV record.
+* TXT Records: This is where the handshake metadata lives. The key is usually n (Name) containing a base64 encoded blob.
+   * PCP (Connection Priority): Byte 0 is 0x23 (High Priority).
+   * Endpoint ID: Bytes 1-4. Must match the ID broadcast over BLE.
+   * Service ID Hash: Bytes 5-7. 0xFC9F5E.
+2.2.2. Implementation via mdns-sd
+On Fedora, avahi-daemon owns port 5353. The Rust app can use the mdns-sd crate to publish services, but a more robust approach for Fedora is to use the Avahi D-Bus API (via zbus or libavahi-client bindings). This ensures that the service is registered system-wide and respects Firewalld zones.1
+* Firewalld Integration: The user must ensure UDP port 5353 is open. The installer for the app should likely install a /usr/lib/firewalld/services/quickshare.xml definition and enable it.15
+________________
+3. Protocol Architecture: The Connection Layer
+Once discovery is successful, the Android device initiates a connection. This is where the proprietary UKEY2 protocol secures the link.
+3.1. The UKEY2 (User Key Exchange v2) Handshake
+UKEY2 is an authenticated Diffie-Hellman key exchange designed to be robust against Man-in-the-Middle (MITM) attacks on the secure channel, although strictly speaking, the initial exchange is "trust on first use" (TOFU) unless verified by the PIN code.1
+3.1.1. The Handshake Sequence
+1. Connection Establishment: Android connects to the Linux app's TCP port (discovered via mDNS) or P2P socket.
+2. Client Init: Android sends a Ukey2Message (Type: CLIENT_INIT).
+   * Contains a list of supported "Commitments" (Hashes of public keys).
+   * Contains a random 32-byte nonce.
+3. Server Init: The Linux app (Server) must respond with SERVER_INIT.
+   * Selects the Cipher Suite (usually P256_SHA512).
+   * Sends the Server's Public Key (on NIST P-256 curve).
+   * Sends a random 32-byte nonce.
+4. Client Finish: Android responds with CLIENT_FINISH.
+   * Contains the Client's Public Key.
+   * At this point, both sides perform ECDH to derive the Master Secret.
+3.1.2. Cryptographic Primitives in Rust
+The implementation requires specific cryptographic primitives:
+* NIST P-256 (secp256r1): For the key exchange. The p256 crate or ring crate are suitable pure-Rust options.17
+* SHA-256 / SHA-512: For hashing commitments and key derivation (HKDF).
+* AES-256-CBC: For the payload encryption.
+* HMAC-SHA256: For packet integrity.
+The Rust ecosystem is well-suited for this. The ring crate is highly recommended for its performance and security auditing, although openssl bindings might be necessary if strict compatibility with Google's specific crypto quirks is required (though unlikely for standard algorithms).
+3.1.3. The Connection Token (The PIN)
+To prevent MITM, both devices display a 4-digit PIN. This PIN is derived from the Auth String, which is an HKDF (HMAC-based Key Derivation Function) expansion of the Master Secret.
+* Calculation: Token = HKDF(MasterSecret, "UKEY2 v1 auth", 32 bytes).
+* UI Requirement: The Linux app must calculate this, format it (typically taking the first few bytes and converting to digits), and present it to the user for verification.
+3.2. Protocol Buffers (Protobuf) Framing
+All messages—both the UKEY2 handshake and the subsequent file transfer frames—are encapsulated in Google Protocol Buffers.
+* Structure:
+Protocol Buffers
+message OfflineFrame {
+ enum Type {
+   INTRODUCTION = 1;
+   CONNECTION_RESPONSE = 2;
+   PAYLOAD_TRANSFER = 3;
+   //...
+ }
+ optional int32 version = 1;
+ optional V1Frame v1 = 2;
+}
+
+* Rust Implementation: The prost crate is the industry standard for Rust protobufs. It generates Rust structs from .proto files at build time. The user will need to acquire the .proto definitions (available in the NearDrop repository 1) and include them in the project’s build.rs.
+________________
+4. Protocol Architecture: The Transport Layer (The "Offline" Problem)
+This section addresses the user's core requirement: "connect directly... without having to install another app." The current open-source landscape mostly supports WLAN (LAN). The user wants Wi-Fi Direct (P2P).
+4.1. The Transport Upgrade Negotiation
+The protocol starts over a low-bandwidth channel (Bluetooth or potentially a temporary low-bandwidth LAN connection) and attempts to "upgrade" to a higher bandwidth medium.
+   1. Introduction Frame: Contains a ConnectionRequest which lists supported mediums (WLAN, WIFI_DIRECT, WEB_RTC).
+   2. Bandwidth Upgrade Frame: If the Linux app indicates support for WIFI_DIRECT in the handshake, the Android device (acting as the P2P Group Owner usually) will send a BandwidthUpgrade message.
+   * Payload: This secure message contains the SSID and Password (WPA2-PSK) of the temporary P2P group created by the phone.19
+4.2. Implementing Wi-Fi Direct on Linux
+This is the most technically demanding aspect of the project. Linux Wi-Fi Direct support is fragmented between wpa_supplicant (the backend) and NetworkManager (the frontend).
+4.2.1. The Conflict: wpa_supplicant vs. NetworkManager
+On Fedora, NetworkManager controls the Wi-Fi interface (wlan0). If the Rust app tries to talk directly to wpa_supplicant to initiate a P2P connection, NetworkManager will likely detect the interference and kill the connection or the wpa_supplicant instance.6
+   * Approach A (The "Hack"): Stop NetworkManager, use wpa_cli to join the group. Verdict: Unacceptable for a consumer app. It kills internet connectivity and destabilizes the system.
+   * Approach B (The Native Way): Use NetworkManager’s D-Bus API to request a P2P connection.
+4.2.2. The NetworkManager D-Bus Strategy
+NetworkManager exposes a wifi-p2p connection type. The Rust app must act as a D-Bus client to dynamically create and activate this connection.
+Step-by-Step Implementation via zbus:
+   1. Receive Credentials: Decrypt the SSID and Password from the BandwidthUpgrade frame (received over the initial BLE/LAN link).
+   2. Create Connection Profile: The app constructs a GVariant map describing the connection.20
+   * connection.type: "wifi-p2p"
+   * connection.id: "QuickShare-P2P"
+   * wifi-p2p.peer: The MAC address of the Android device (provided in the handshake).
+   * wifi-p2p.wps-method: 0 (PBC) or configured for PIN if required (usually Android handles the group setup autonomously, so we act as a client joining with PSK).
+   * 802-11-wireless-security.key-mgmt: "wpa-psk"
+   * 802-11-wireless-security.psk: The password received from Android.21
+   3. Activate Connection: Call org.freedesktop.NetworkManager.Settings.AddConnection followed by ActivateConnection.
+   4. Interface Handover: Once connected, NetworkManager will create a virtual interface (e.g., p2p-wlan0-0). The Rust app must detect this new interface (via Netlink or NM signals) and bind its TCP listener to the IP address assigned by the Android device's DHCP server.
+Table 2: Comparison of Transport Methods
+Feature
+	LAN (WLAN)
+	Wi-Fi Direct (P2P)
+	Throughput
+	High (Dependent on Router)
+	Very High (Direct Link)
+	Dependency
+	Requires external Router
+	Independent (Ad-Hoc)
+	Linux Complexity
+	Low (Standard TCP Sockets)
+	High (NM D-Bus, Virtual Interfaces)
+	Android Behavior
+	Default if on same Wi-Fi
+	Default if Offline or different Wi-Fi
+	Current Linux Support
+	NearDrop / rquickshare
+	Unimplemented (Target Goal)
+	________________
+5. Reverse Engineering Methodology
+To fill the gaps in the public documentation (especially regarding the exact bytes for the 0xFC9F payload and the P2P upgrade frames), the following methodology should be employed.
+5.1. Packet Capture (Sniffing)
+   1. BLE Sniffing:
+   * Hardware: An nRF52840 dongle is highly recommended. It is cheap and supported by Wireshark via the Nordic Sniffer software.22
+   * Technique: Flash the sniffer firmware. Open Wireshark. Filter for btle.advertising_address == [Android MAC]. Trigger a Quick Share from the phone.
+   * Goal: Capture the raw payload of the ADV_IND packet. This provides the "Ground Truth" for the Rust bluer implementation.
+   2. HCI Snooping (Android Side):
+   * Enable: Developer Options > "Enable Bluetooth HCI snoop log".
+   * Transfer: Toggle Bluetooth, attempt a share, then adb pull /sdcard/btsnoop_hci.log.23
+   * Analysis: This log shows exactly what the Android OS sends to the Bluetooth controller. It is cleaner than over-the-air sniffing as it is not subject to RF interference.
+5.2. Analyzing NearDrop and Chromium Source
+While NearDrop is Swift (macOS) and rquickshare is Rust, they both derive from the Chromium source code.
+   * Chromium Source: Google’s implementation of "Nearby" is open source within the Chromium project. Searching for kNearbySharingServiceUuid or Ukey2 in the Chromium codebase (via source.chromium.org) provides C++ reference implementations for the state machines.1
+   * Decompilation: For Samsung-specific quirks, one might need to decompile the com.google.android.gms APK using JADX. Look for classes in the com.google.android.gms.nearby.sharing namespace. This is legally grey and should be done with caution, strictly for interoperability purposes.
+________________
+6. Rust Implementation Strategy
+The following section outlines the software architecture for the proposed application, tentatively named linquick.
+6.1. Crate Selection and Justification
+   * tokio: The asynchronous runtime. Essential for handling multiple concurrent connections (BLE listener, mDNS responder, TCP socket) without blocking.14
+   * zbus: A pure Rust D-Bus crate. Unlike dbus-rs (which wraps libdbus), zbus is async-first and integrates natively with tokio. This is critical for talking to NetworkManager and BlueZ smoothly.10
+   * bluer: The official Rust interface for BlueZ. It uses D-Bus under the hood but provides a high-level API for "Advertising" and "Scanning".9
+   * prost: For Protobuf manipulation. It is faster and generates cleaner code than protobuf-codegen.
+   * ring: For crypto. It provides the NIST P-256 and SHA-256 primitives.
+   * mdns-sd or libmdns: For service discovery.
+6.2. Architecture Modules
+   1. discovery Module:
+   * Submodule ble: Uses bluer to register the 0xFC9F advertisement. It must handle the "Start/Stop" logic based on app state.
+   * Submodule mdns: Uses mdns-sd to publish the _FC9F5ED42C8A._tcp service.
+   2. protocol Module:
+   * Submodule framing: Handles the read/write of OfflineFrame (Length-prefixed Protobufs).
+   * Submodule ukey2: Implements the handshake state machine (Init -> Verify -> Auth).
+   * Submodule crypto: Wraps ring to provide encrypt_packet() and decrypt_packet() functions using the derived keys.
+   3. transport Module:
+   * Submodule tcp: Standard tokio::net::TcpListener.
+   * Submodule p2p: The D-Bus Client for NetworkManager. It implements the AddConnection logic described in Section 4.2.2.
+   4. ui Module:
+   * Since the user is on Fedora, a GTK4 interface using gtk4-rs and libadwaita would feel native. It needs to show the "PIN Code" and a "Accept/Decline" dialog.25
+6.3. The "Offline" Handshake State Machine
+
+
+Rust
+
+
+
+
+// Conceptual State Machine for P2P Handover
+enum TransportState {
+   ListeningLAN,
+   Handshake(Ukey2Context),
+   ConnectedLAN(TcpStream),
+   UpgradeRequested(P2PCredentials),
+   SwitchingToP2P,
+   ConnectedP2P(TcpStream),
+}
+
+async fn handle_upgrade(creds: P2PCredentials, nm_proxy: &NetworkManagerProxy) -> Result<TcpStream> {
+   // 1. Tell NetworkManager to Connect
+   let connection_path = nm_proxy.add_wifi_p2p_connection(creds.ssid, creds.pass).await?;
+   
+   // 2. Wait for Interface to come up (listen to NM signals)
+   let p2p_interface = wait_for_interface("p2p-wlan0-0").await?;
+   
+   // 3. Bind new Listener on P2P IP
+   let listener = TcpListener::bind((p2p_interface.ip, 7000)).await?;
+   
+   // 4. Accept the incoming connection from Android on the new link
+   let (socket, _) = listener.accept().await?;
+   Ok(socket)
+}
+
+Insight: The Android device acts as the DHCP server in P2P Group Owner mode. The Linux machine (Client) will receive an IP in the 192.168.49.x range. The Rust app must bind to 0.0.0.0 or specifically to the P2P interface IP to accept the connection.
+________________
+7. Challenges and Mitigations on Fedora
+7.1. Firewalld and Port Management
+By default, Fedora blocks incoming connections.
+   * Challenge: The mDNS port (5353) might be open, but the random TCP port chosen for the transfer (e.g., 45321) will be blocked.
+   * Solution:
+   * Development: sudo firewall-cmd --add-port=1024-65535/tcp (Insecure, useful for testing).26
+   * Production: The Rust app should use the Firewalld D-Bus API to request a "Runtime Zone" modification, adding the specific port it bound to for the duration of the session. Alternatively, configure the app to use a static port (e.g., 40000) and ship a .xml service definition with the RPM that opens this specific port.4
+7.2. SELinux Policies
+If the app is packaged as a system service or an confined Flatpak, SELinux will block access to NetworkManager D-Bus interfaces.
+   * Mitigation:
+   * For Flatpak, use the permissions section in the manifest to request network-manager access.
+   * For RPM, if running as a user, standard PolicyKit (polkit) rules usually allow a logged-in user to control network settings. However, creating a P2P connection might trigger an authentication prompt ("Authentication is required to modify network settings"). The Rust app must handle this gracefully or prompt the user to authorize via the polkit agent.
+7.3. Hardware Limitations
+Not all Wi-Fi cards support Virtual Interface Combination required for P2P.
+   * Check: Run iw list and look for valid interface combinations.
+   * Scenario: If the hardware only supports one channel, and the laptop is connected to a 5GHz Wi-Fi while the Android P2P group is on 2.4GHz, the connection will fail.
+   * Fallback: The app must gracefully degrade. If P2P upgrade fails, it should stick to the LAN connection or inform the user to switch networks.
+________________
+8. Conclusion
+Engineering a native Linux bridge for Android Quick Share is a complex but achievable goal. It requires moving beyond simple socket programming into the realm of system orchestration—manipulating Bluetooth advertisements, negotiating encryption keys, and dynamically reconfiguring network interfaces.
+For the user, currently working in Rust on Fedora, the path forward involves:
+   1. Phase 1 (LAN): Implement mdns-sd and prost to get basic discovery and file transfer working over Wi-Fi. This matches the capability of NearDrop.
+   2. Phase 2 (BLE): Use bluer to implement the 0xFC9F advertisement, enabling discovery even when mDNS is blocked.
+   3. Phase 3 (P2P - The Innovation): Tackle the NetworkManager integration using zbus. This is the differentiator that will provide true "Client-less" offline capability, bridging the final gap between the ecosystems.
+This report confirms that while the documentation for Linux Wi-Fi P2P is sparse, the combination of NetworkManager's D-Bus API and Rust's type-safe async ecosystem provides the necessary tools to reverse engineer and implement this missing link.
+________________
+Appendix: Implementation Checklist
+   * [ ] Setup: Fedora 40+, Rust 1.75+, openssl-devel, dbus-devel, bluez-libs-devel.
+   * [ ] Capture: Get btsnoop_hci.log from Android to verify BLE payload format.
+   * [ ] Protobufs: Compile offline_wire_formats.proto using prost-build.
+   * [ ] Discovery: Implement bluer Advertisement for UUID 0xFC9F.
+   * [ ] Crypto: Implement ring based ECDH-P256.
+   * [ ] Network: Implement zbus wrapper for org.freedesktop.NetworkManager.AddConnection.
+   * [ ] Firewall: Create firewalld service definition.
+Works cited
+   1. NearDrop/PROTOCOL.md at master - GitHub, accessed January 16, 2026, https://github.com/grishka/NearDrop/blob/master/PROTOCOL.md
+   2. What is Android 'Nearby Sharing'? How does it work? - Quora, accessed January 16, 2026, https://www.quora.com/What-is-Android-Nearby-Sharing-How-does-it-work
+   3. Google and Samsung are merging Nearby Share and Quick Share into a singular cross-Android solution - Reddit, accessed January 16, 2026, https://www.reddit.com/r/Android/comments/192n62l/google_and_samsung_are_merging_nearby_share_and/
+   4. Martichou/rquickshare: Rust implementation of NearbyShare/QuickShare from Android for Linux and macOS. - GitHub, accessed January 16, 2026, https://github.com/Martichou/rquickshare
+   5. Wifi direct crate/lib in Rust/C++ - help, accessed January 16, 2026, https://users.rust-lang.org/t/wifi-direct-crate-lib-in-rust-c/78574
+   6. Network Manager and Rust's zbus - Think Deeply and Rebuild Things, accessed January 16, 2026, https://rbs.io/2024/07/network-manager-and-rusts-zbus/
+   7. Control of System Accessibility by firewalld - Fedora Docs, accessed January 16, 2026, https://docs.fedoraproject.org/en-US/quick-docs/firewalld/
+   8. Bug in SELinux related to NetworkManager? - Fedora Discussion, accessed January 16, 2026, https://discussion.fedoraproject.org/t/bug-in-selinux-related-to-networkmanager/171884
+   9. BlueR — Official BlueZ Bindings for Rust - Crates.io, accessed January 16, 2026, https://crates.io/crates/bluer
+   10. Network Manager and zbus, accessed January 16, 2026, https://tbro.github.io/posts/2025-06-27-network-manager-and-zbus.html
+   11. Advertising payload: Fast Pair Account Data - Google for Developers, accessed January 16, 2026, https://developers.google.com/nearby/fast-pair/specifications/service/provider
+   12. Key-based Pairing characteristic - Fast Pair | Google for Developers, accessed January 16, 2026, https://developers.google.com/nearby/fast-pair/specifications/characteristics
+   13. Android Nearby Share compatibility with Windows Nearby Connections · google nearby · Discussion #2446 - GitHub, accessed January 16, 2026, https://github.com/google/nearby/discussions/2446
+   14. Send More Than Device Data Over Bluetooth LE with Rust | by Paul Otto - Medium, accessed January 16, 2026, https://medium.com/@potto_94870/send-more-than-device-data-over-bluetooth-le-with-rust-97885316b42d
+   15. Multicast UDP packets (MDNS/Bonjour protocol) blocked by default? · Issue #21 - GitHub, accessed January 16, 2026, https://github.com/firewalld/firewalld/issues/21
+   16. google/ukey2 - GitHub, accessed January 16, 2026, https://github.com/google/ukey2
+   17. Rust Crypto - GitHub, accessed January 16, 2026, https://github.com/rustcrypto
+   18. nearby/connections/ukey2 - platform/external/rust/beto-rust - Git at, accessed January 16, 2026, https://android.git.googlesource.com/platform/external/rust/beto-rust/+/refs/tags/android-security-16.0.0_r2/nearby/connections/ukey2
+   19. (PDF) Device-to-device communications with Wi-Fi Direct: overview and experimentation, accessed January 16, 2026, https://www.researchgate.net/publication/260288624_Device-to-device_communications_with_Wi-Fi_Direct_overview_and_experimentation
+   20. wifi-p2p: NetworkManager Reference Manual, accessed January 16, 2026, https://networkmanager.dev/docs/api/1.52.0/settings-wifi-p2p.html
+   21. nm-settings-nmcli: NetworkManager Reference Manual, accessed January 16, 2026, https://networkmanager.dev/docs/api/latest/nm-settings-nmcli.html
+   22. Master BLE Sniffing: nRF52840 USB Dongle & Wireshark Guide - Novel Bits, accessed January 16, 2026, https://novelbits.io/nordic-ble-sniffer-guide-using-nrf52840-wireshark/
+   23. Reverse engineering of BLE protocol for holiday light : r/homeassistant - Reddit, accessed January 16, 2026, https://www.reddit.com/r/homeassistant/comments/18tl76b/reverse_engineering_of_ble_protocol_for_holiday/
+   24. A learning experience with NetworkManager and zbus - DEV Community, accessed January 16, 2026, https://dev.to/tbxyz_0/a-learning-experience-with-networkmanager-and-zbus-1emk
+   25. Packet is an Android Quick Share App for Linux - OMG! Ubuntu, accessed January 16, 2026, https://www.omgubuntu.co.uk/2025/06/packet-linux-android-file-transfer-app-quick-share
+   26. firewalld accept response to multicast DNS query from ephemeral port, accessed January 16, 2026, https://unix.stackexchange.com/questions/241915/firewalld-accept-response-to-multicast-dns-query-from-ephemeral-port
