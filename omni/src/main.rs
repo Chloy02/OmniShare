@@ -1,5 +1,6 @@
 mod discovery;
 mod connection_manager;
+pub mod proto;
 
 use clap::{Parser, Subcommand};
 
@@ -35,8 +36,14 @@ async fn main() -> anyhow::Result<()> {
             // Port 5200 is standard for Quick Share (though it can be dynamic)
             let _mdns = discovery::mdns_native::MdnsService::start("OmniShare", 5200)?;
 
-            // Phase 1 (BLE Native) - Blocks until Ctrl-C
-            discovery::ble_native::run_forever().await?;
+            println!("Starting BLE and TCP Services concurrently...");
+            let _ = tokio::join!(
+                // Phase 1 (BLE Native) - The "Shout"
+                discovery::ble_native::run_forever(),
+                
+                // Phase 2 (TCP Server) - The "Ear"
+                connection_manager::ConnectionManager::start_server()
+            );
         },
         Commands::Connect { ip } => {
             println!("Connecting to {}...", ip);

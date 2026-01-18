@@ -41,7 +41,8 @@ message ConnectionRequest {
   optional string endpoint_name = 2;
   optional string endpoint_info = 3; // The raw bytes including Device Type info
   optional int32 nonce = 4;
-  optional bytes handshake_data = 5; // The UKEY2 Client Init message
+  repeated int32 mediums = 5; // e.g., BLE, WIFI_LAN, etc.
+  optional bytes handshake_data = 6; // The UKEY2 Client Init message
 }
 
 message ConnectionResponse {
