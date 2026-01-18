@@ -30,7 +30,12 @@ async fn main() -> anyhow::Result<()> {
     match &cli.command {
         Commands::Run => {
             println!("Starting OmniShare Native Service...");
-            // Phase 1 (BLE Native)
+            
+            // Phase 2 (mDNS Native) - Start Background Daemon
+            // Port 5200 is standard for Quick Share (though it can be dynamic)
+            let _mdns = discovery::mdns_native::MdnsService::start("OmniShare", 5200)?;
+
+            // Phase 1 (BLE Native) - Blocks until Ctrl-C
             discovery::ble_native::run_forever().await?;
         },
         Commands::Connect { ip } => {

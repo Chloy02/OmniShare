@@ -17,6 +17,8 @@ hex = "0.4"
 uuid = "1.0"
 prost = "0.12"
 futures = "0.3"
+mdns-sd = "0.10"
+base64 = "0.22"
 
 [build-dependencies]
 prost-build = "0.12"
