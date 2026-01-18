@@ -67,7 +67,7 @@ impl ConnectionManager {
             if let Ok(frame) = OfflineFrame::decode(&payload_buf[..]) {
                 if let Some(v1) = frame.v1 {
                     decoded_something = true;
-                    println!("TCP Handler: ✅ Decoded OfflineFrame (Type: {:?})", v1.r#type);
+                    println!("TCP Handler: Decoded OfflineFrame (Type: {:?})", v1.r#type);
                     
                     if let Some(req) = v1.connection_request {
                         println!("TCP Handler: 📱 CONNECTION REQUEST DETECTED");
@@ -82,22 +82,69 @@ impl ConnectionManager {
             // Attempt 2: UKEY2 Message (e.g., ClientInit)
             if !decoded_something {
                 if let Ok(ukey_msg) = Ukey2Message::decode(&payload_buf[..]) {
-                    // Check if message_type is present and valid
                     if let Some(msg_type) = ukey_msg.message_type {
                          decoded_something = true;
-                         println!("TCP Handler: 🔐 UKEY2 MESSAGE DETECTED (Type: {:?})", msg_type);
-                         println!("    -> Data: {} bytes", ukey_msg.message_data.as_ref().map_or(0, |d| d.len()));
+                         println!("TCP Handler: UKEY2 MESSAGE DETECTED (Type: {:?})", msg_type);
                          
-                         // If this is CLIENT_INIT (2), we need to extract the "Commitment" inside
-                         if msg_type == crate::proto::ukey2::ukey2_message::Type::ClientInit.into() {
-                             println!("TCP Handler: 🚀 This is the Key Exchange Init! We need to reply!");
+                         let msg_type_enum = crate::proto::ukey2::ukey2_message::Type::try_from(msg_type).ok();
+
+                         // --- HANDSHAKE STATE MACHINE ---
+                         if msg_type_enum == Some(crate::proto::ukey2::ukey2_message::Type::ClientInit) {
+                             println!("TCP Handler: Processing CLIENT_INIT...");
+                             
+                             // 1. Initialize Server (in real app, do this once)
+                             use crate::security::ukey2::Ukey2Server;
+                             use tokio::io::AsyncWriteExt;
+                             
+                             let server = Ukey2Server::new().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                             
+                             if let Some(inner_data) = &ukey_msg.message_data {
+                                 match server.handle_client_init(inner_data) {
+                                     Ok((reply_bytes, pending)) => {
+                                         // Send Reply
+                                         let len_prefix = (reply_bytes.len() as u32).to_be_bytes();
+                                         socket.write_all(&len_prefix).await?;
+                                         socket.write_all(&reply_bytes).await?;
+                                         println!("TCP Handler: Sent UKEY2 Server Init!");
+                                         println!("TCP Handler: Waiting for CLIENT_FINISHED...");
+                                         
+                                         // --- NESTED READ FOR PACKET 3 ---
+                                          let mut length_buf = [0u8; 4];
+                                          socket.read_exact(&mut length_buf).await?;
+                                          let msg_len = u32::from_be_bytes(length_buf) as usize;
+                                          let mut payload_buf_3 = vec![0u8; msg_len];
+                                          socket.read_exact(&mut payload_buf_3).await?;
+                                          
+                                          println!("TCP Handler: Packet 3 (Raw): {}", hex::encode(&payload_buf_3));
+
+                                          let msg3 = Ukey2Message::decode(&payload_buf_3[..])?;
+                                          if msg3.message_type == Some(crate::proto::ukey2::ukey2_message::Type::ClientFinished.into()) {
+                                              println!("TCP Handler: RECEIVED CLIENT_FINISHED!");
+                                              if let Some(fin_data) = &msg3.message_data {
+                                                  let keys = pending.handle_client_finished(fin_data)
+                                                      .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                                                  
+                                                  println!("TCP Handler: Handshake Complete! Keys Derived.");
+                                                  println!("    -> Auth String: {}", hex::encode(&keys.auth_string));
+                                                  println!("    -> D2D Client Key: {}", hex::encode(&keys.d2d_client_key));
+                                                  println!("    -> D2D Server Key: {}", hex::encode(&keys.d2d_server_key));
+                                                  
+                                                  // Handshake Done.
+                                              }
+                                          } else {
+                                              println!("TCP Handler: Expected ClientFinished, got {:?}", msg3.message_type);
+                                          }
+                                     },
+                                     Err(e) => println!("TCP Handler: Handshake Error: {}", e),
+                                 }
+                             }
                          }
                     }
                 }
             }
 
             if !decoded_something {
-                println!("TCP Handler: ❌ Unknown Packet Format. Raw Hex: {}", hex::encode(&payload_buf));
+                println!("TCP Handler: Unknown Packet Format. Raw Hex: {}", hex::encode(&payload_buf));
             }
         }
     }

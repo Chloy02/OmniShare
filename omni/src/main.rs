@@ -1,5 +1,6 @@
 mod discovery;
 mod connection_manager;
+mod security;
 pub mod proto;
 
 use clap::{Parser, Subcommand};

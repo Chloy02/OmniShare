@@ -23,13 +23,25 @@ message Ukey2Message {
   optional bytes message_data = 2;
 }
 
+message EcP256PublicKey {
+  optional bytes x = 1;
+  optional bytes y = 2;
+}
+
+message GenericPublicKey {
+  enum Type {
+    UNKNOWN = 0;
+    EC_P256 = 1;
+  }
+  optional int32 type = 1; // 1 for EC_P256
+  optional EcP256PublicKey ec_p256_public_key = 2; 
+}
+
 message Ukey2ClientInit {
   optional int32 version = 1;
   optional bytes random = 2;
-
   // The next_protocol string is "AES_256_CBC-HMAC_SHA256" typically
-  optional string next_protocol = 3; 
-
+  optional bytes next_protocol = 3; 
   repeated Ukey2HandshakeCipher cipher_commitments = 4;
 }
 
@@ -37,11 +49,11 @@ message Ukey2ServerInit {
   optional int32 version = 1;
   optional bytes random = 2;
   optional Ukey2HandshakeCipher handshake_cipher = 3;
-  optional bytes public_key = 4;
+  optional GenericPublicKey public_key = 4;
 }
 
 message Ukey2ClientFinished {
-  optional bytes public_key = 1;
+  optional GenericPublicKey public_key = 1;
 }
 
 message Ukey2Alert {

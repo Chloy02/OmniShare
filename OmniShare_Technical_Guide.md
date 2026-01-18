@@ -192,3 +192,64 @@ We have successfully emulated a closed-source, proprietary discovery protocol by
 3.  **System:** Navigating the specific constraints of the Linux Network/Bluetooth stack.
 
 **Next Phase:** Now that we are *visible*, we must become *connectable* (TCP Server + UKEY2 Handshake).
+
+## 7. Phase 2: The Physical Connection (TCP & Framing)
+
+Once Discovery is successful, the Android device initiates a physical connection. This marks the transition from "Broadcasting" (Phase 1) to "Handshaking" (Phase 2).
+
+### 7.1 The Transport Layer (Port 5200)
+
+*   **Protocol:** TCP (Reliable Stream).
+*   **Port:** Default is , though the mDNS record can specify otherwise.
+*   **Behavior:** The phone opens a socket. If we accept, the "Connecting..." spinner continues. If we reject (RST), it fails immediately.
+
+### 7.2 The Wire Format (Framing)
+
+Quick Share does not send raw Protobufs. It uses a **Length-Prefixed Framing** system to handle TCP stream fragmentation.
+
+**The Frame Structure:**
+
+*   **Length:** A 32-bit Unsigned Integer, encoded in **Big Endian** (Network Byte Order).
+*   **Payload:** The actual Protobuf message.
+
+*Implementation Note:* In Rust, we use  to read the header, allocate a buffer of that size, and then  the payload.
+
+### 7.3 The "Double Packet" Phenomenon
+
+Crucially, the phone does **not** send all data in one packet. It splits the initial handshake into two distinct frames sent back-to-back.
+
+**Frame 1: The Identity ()**
+*   **Protobuf:**  (Type 1).
+*   **Content:** Contains the  (Device Name, Type) and .
+*   **Purpose:** "Hi, I am [Phone Name]. I want to connect."
+
+**Frame 2: The Keys ()**
+*   **Protobuf:**  (Type 2: CLIENT_INIT).
+*   **Content:** The P-256 Public Key and a random "Commitment".
+*   **Purpose:** "Here is my half of the encryption key. What is yours?"
+
+*Debugging Lesson:* We initially failed to decode Frame 2 because we assumed it was also an . It is **NOT**. It is a raw . The protocol switches message types dynamically.
+
+### 7.4 The "Mediums" Trap (Protobuf Debugging)
+
+During implementation, we encountered a .
+*   **The Cause:** Our  definition for  expected  (bytes) at Field 5.
+*   **The Reality:** The phone sent a  (Number) at Field 5.
+*   **The Fix:** Field 5 is actually  (a list of supported transports like WiFi/BLE).  is actually at **Field 6**.
+*   **Lesson:** Reverse engineering requires adaptability. When the map says "Left" but the road goes "Right", follow the road.
+
+---
+
+## 8. What's Next: The Cryptographic Reply (Phase 3)
+
+We have successfully caught the . The connection drops now because we are rude—we don't reply.
+
+**The UKEY2 State Machine:**
+1.  **Client:** Sends  (We have this).
+2.  **Server (Us):** Must send .
+    *   Generate a P-256 Keypair.
+    *   Compute Shared Secret (ECDH).
+    *   Derive AES-256 Session Keys (HKDF).
+3.  **Client:** Sends .
+
+**Current Status:** Ready to implement .
