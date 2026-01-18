@@ -1,210 +1,199 @@
-# OmniShare Learning Guide: The "Zero-Install" Protocol
+# OmniShare: The Definitive Technical Guide & Development Bible
 
-This guide serves as the definitive technical reference for **OmniShare**, documenting how we reverse-engineered the Google Quick Share protocol to enable "Zero-Install" file transfer between Linux and Android.
+**Version:** 1.0 (The Discovery Edition)
+**Authors:** Chloy Costa & Antigravity
+**Status:** Phase 1 Complete (Discovery & Visibility Verified)
 
 ---
 
-## 🏗️ 1. The High-Level Architecture
+## Table of Contents
 
-The core philosophy of OmniShare is **Emulation**. Instead of asking the user to install a new app, we trick the Android phone into thinking the Linux computer is another trusted Android device or Chromebook.
+1.  [Introduction: The "Zero-Install" Philosophy](#1-introduction)
+2.  [The Theory of Wireless Discovery](#2-theory)
+    *   2.1 Bluetooth Low Energy (BLE) Mechanics
+    *   2.2 Multicast DNS (mDNS) & ZeroConf
+    *   2.3 The "Hybrid Discovery" Pattern
+3.  [Quick Share Protocol: Reverse Engineered](#3-quick-share-reversed)
+    *   3.1 The "Trigger" Packet (0xFE2C)
+    *   3.2 The "Identity" Record (mDNS)
+    *   3.3 Cryptography & Hashing (The PCP Protocol)
+4.  [Implementation: Building OmniShare on Linux](#4-implementation)
+    *   4.1 The BlueZ Stack & D-Bus Architecture
+    *   4.2 The Rust Implementation (`bluer` & `mdns-sd`)
+5.  [The Graveyard of Failures (Post-Mortem Analysis)](#5-failures)
+    *   5.1 The Service UUID Trap (0xFC9F vs 0xFE2C)
+    *   5.2 The Firewall Wall
+    *   5.3 The "Name" vs "Instance" Spec Violation
+6.  [Future Roadmap: The Connection Phase](#6-roadmap)
 
-This interaction happens in four distinct phases:
+---
 
-```mermaid
-sequenceDiagram
-    participant Linux as OmniShare (Linux)
-    participant Phone as Android Phone
-    
-    Note over Linux, Phone: Phase 1: Discovery (The "Wake Up")
-    Linux->>Phone: BLE Advertisement (0xFE2C) + Random Salt
-    Phone->>Phone: Wakes up High-Power WiFi
-    Phone-->>Linux: mDNS Broadcast (_FC9F5ED42C8A._tcp)
-    
-    Note over Linux, Phone: Phase 2: Connection (The "Handshake")
-    Linux->>Phone: TCP Connect (Port 8686)
-    Linux->>Phone: UKEY2 ClientInit (Curve25519 Public Key)
-    Phone-->>Linux: UKEY2 ServerInit (Curve25519 Public Key)
-    
-    Note over Linux, Phone: Phase 3: Authentication (The "Passport")
-    Linux->>Phone: ConnectionRequest (Protobuf)
-    Phone->>Linux: ConnectionResponse (with PIN)
-    
-    Note over Linux, Phone: Phase 4: Data Plane
-    Linux->>Phone: PayloadTransfer (File Bytes)
+## 1. Introduction: The "Zero-Install" Philosophy
+
+OmniShare aims to bridge the Linux-Android divide without requiring a companion app on the Android phone. We leverage the native **Quick Share** (formerly Nearby Share) protocol built into Google Play Services.
+
+**The Challenge:** Google does not publish this protocol. It is a proprietary, closed-source standard.
+**The Solution:** We act as a "Protocol Emulator," speaking the exact byte sequences Android expects, convincing the OS that our Linux machine is a supported peer (like a Chromebook).
+
+---
+
+## 2. The Theory of Wireless Discovery
+
+To understand *how* we solved discovery, we must understand the underlying transport technologies.
+
+### 2.1 Bluetooth Low Energy (BLE) Mechanics
+
+BLE is designed for short bursts of data, not high throughput.
+*   **Advertising (The "Shout"):** A device broadcasts small packets (31 bytes in Legacy Mode) on channels 37, 38, and 39. Scanners listen passively.
+*   **GATT (Generic Attribute Profile):** Once connected, devices exchange data via "Services" and "Characteristics".
+*   **Legacy vs. Extended Advertising:**
+    *   *Legacy (ADV_IND):* Max 31 bytes payload. Compatible with ALL scanners.
+    *   *Extended (ADV_EXT_IND):* Up to 255 bytes. Requires newer hardware. connection
+    *   *OmniShare Choice:* We use **Legacy Advertising**. Why? Android's background scanning hardware filters are optimized for Legacy packets to save battery. Extended packets were consistently ignored in our tests.
+
+### 2.2 Multicast DNS (mDNS) & ZeroConf
+
+mDNS (RFC 6762) allows devices to resolve names to IP addresses without a central DNS server.
+*   **The Mechanism:** Instead of asking a server "Who is `printer.local`?", the device sends a UDP Multicast packet to `224.0.0.251:5353`.
+*   **The Response:** The target machine replies "I am `printer.local`, my IP is `192.168.1.50`".
+*   **Service Discovery (DNS-SD):** Devices can announce *capabilities* (e.g., `_ipp._tcp` for printing). Android looks for `_FC9F5ED42C8A._tcp` for Quick Share.
+
+### 2.3 The "Hybrid Discovery" Pattern
+
+Quick Share uses a clever "Two-Stage" handoff to balance speed and battery life:
+
+1.  **Stage 1 (Low Power):** The sender broadcasts a BLE "Trigger".
+    *   *Power:* Low (~1mA).
+    *   *Range:* Short (~10m).
+    *   *Data:* ZERO identity info. Just a random salt and a Model ID.
+2.  **Stage 2 (High Power):** The receiver (Phone) wakes up its WiFi radio and scans for mDNS.
+    *   *Power:* High (~200mA+).
+    *   *Data:* Full Identity (Name, Device Type, IP, Port).
+
+**Crucial Insight:** If Stage 1 is missing, Stage 2 never happens. If Stage 2 is missing, Stage 1 is ignored as a ghost signal. **Both must be perfect.**
+
+---
+
+## 3. Quick Share Protocol: Reverse Engineered
+
+Here is the exact specification we uncovered.
+
+### 3.1 The "Trigger" Packet (0xFE2C)
+
+The BLE Advertisement MUST contain this specific Service Data payload.
+
+**Service UUID:** `0xFE2C` (Google Fast Pair Service).
+
+**Payload Structure (15 Bytes):**
+```text
+Byte | Value | Description
+-----|-------|------------------------------------------------
+0    | 0xFC  | Model ID Byte 1 \
+1    | 0x12  | Model ID Byte 2  > "This is Quick Share"
+2    | 0x8E  | Model ID Byte 3 /
+3    | 0x01  | Opcode (0x01 = Visibility Announcement)
+4    | 0x42  | Meta/Length Byte
+5-14 | [RND] | 10 Bytes of Random Salt (Anti-Replay)
+```
+*   *Note:* The "Model ID" `FC128E` is the magic key. If this sequence is wrong, Android hardware filters block the packet.
+
+### 3.2 The "Identity" Record (mDNS)
+
+Once the phone wakes up, it queries `_FC9F5ED42C8A._tcp`.
+
+**Service Type Hash (`FC9F...`):**
+This string is `SHA256("NearbySharing")[0..6]`. It is hardcoded in Android.
+
+**TXT Record (`n` Key):**
+The value of `n` is a Base64-encoded binary blob containing the visual metadata.
+```text
+Binary Structure:
+[Byte 0] Status Bitmask
+   Bits 7-5: Version (0)
+   Bit  4:   Visibility (0 = Visible)
+   Bits 3-1: Device Type (3 = Laptop, 1 = Phone)
+   Bit  0:   Reserved (0)
+   -> Result: 0x06 for a Visible Laptop.
+
+[Bytes 1-16] Encryption Salt / Account Hash
+   For "Everyone Mode", these can be random bytes.
+
+[Byte 17] Name Length (L)
+[Bytes 18..18+L] Device Name (UTF-8, e.g., "OmniShare")
 ```
 
----
+### 3.3 The "Instance Name" (The PCP Hash)
 
-## 📡 2. Phase 1: Discovery (The "Wake Up" Call)
+This was the hardest part to crack. The mDNS Service Instance Name (the `Name` in `Name._type.domain`) cannot be arbitrary.
 
-Native Android devices don't just stay awake listening for connections (that would kill the battery). They sleep until triggered.
+**Format:** `Base64([PCP][EndpointID][ServiceHash][Padding])`
+*   **PCP Header:** `0x23` (Unknown Protocol Constant, likely "Public Connection Protocol").
+*   **Endpoint ID:** 4 Random Alphanumeric Bytes (e.g., "Xy9z"). This acts as a session ID.
+*   **Service Hash:** `0xFC, 0x9F, 0x5E` (Truncated SHA256 of "NearbySharing").
+*   **Padding:** `0x00, 0x00`.
 
-### 2.1 Bluetooth Low Energy (BLE) Trigger
-We use a specific BLE advertisement to wake the phone.
-*   **Service UUID**: `0xFE2C` (Google Fast Pair Service).
-*   **Mechanism**: We broadcast a "Fast Advertisement" that tells nearby phones "I am a Quick Share sender."
-
-**The Packet Structure:**
-To bypass the phone's **Replay Protection**, we must randomize the payload every session. If we send the exact same bytes, the phone thinks "I heard you already" and ignores us.
-
-| Byte | Value | Description |
-| :--- | :--- | :--- |
-| 0 | `0xFC` | Service ID Head |
-| 1 | `0x12` | Length |
-| 2 | `0x8E` | Endpoint Info Header |
-| 3 | `0x01` | Version/Flags |
-| 4-24 | `Random` | **The Salt**: 20 bytes of random noise to ensure uniqueness. |
-
-### 2.2 mDNS (Multicast DNS)
-Once the phone hears the BLE trigger, it wakes up its WiFi chip and broadcasts its presence on the local network.
-*   **Protocol**: mDNS (ZeroConf/Avahi).
-*   **Service Type**: `_FC9F5ED42C8A._tcp`.
-*   **Resolution**: OmniShare listens for this specific shout to find the phone's **IP Address** (e.g., `192.168.1.5`) and **Port** (usually `8686`).
+**Why?** This structure allows the phone to validate the service *before* connecting. If the name is just "OmniShare", the validation regex fails.
 
 ---
 
-## 🔐 3. Phase 2 & 3: The Handshake (UKEY2)
+## 4. Implementation: Building OmniShare on Linux
 
-Google doesn't trust open connections. We must prove we are secure. We use **UKEY2 (User Key Exchange v2)**, an authenticated Diffie-Hellman protocol.
+### 4.1 The BlueZ Stack & D-Bus Architecture
 
-### 3.1 The Cryptography: Diffie-Hellman
-We use **Curve25519**, a state-of-the-art Elliptic Curve Cryptography (ECC) system.
+Linux handles Bluetooth via the `bluetoothd` daemon. We don't talk to the hardware directly; we talk to `bluetoothd` via D-Bus (IPC).
 
-**The Concept:**
-1.  **Alice (Linux)** generates a private color (Private Key) and mixes it to make a public color (Public Key).
-2.  **Bob (Android)** does the same.
-3.  They swap Public Keys.
-4.  **Math Magic**: `AlicePrivate + BobPublic` = `BobPrivate + AlicePublic`.
-5.  They now share a **Secret Session Key** that nobody else knows.
+*   **API:** `org.bluez.LEAdvertisement1`
+*   **Challenge:** We must register an object on D-Bus, then tell BlueZ to "read" it.
+*   **Crate:** `bluer` provides the Rust bindings. It uses `tokio` to handle the async D-Bus signals.
 
-### 3.2 The Message Flow
-1.  **ClientInit**: Linux sends its Public Key and a "Commitment" (Hash) of the handshake.
-2.  **ServerInit**: Android replies with its Public Key.
-3.  **Verification**: Both sides display a **PIN Code** derived from the Secret Key (e.g., "1234"). Users compare them to prove no "Man in the Middle" is listening.
+### 4.2 The Rust Implementation
 
----
+**Module:** `discovery/ble_native.rs`
+*   Uses `Advertiser` to broadcast the payload.
+*   Implements a local GATT callback to satisfy BlueZ registration requirements (even though we don't actively use GATT for transfer).
 
-## 📖 4. Phase 4: The Language (Protobuf)
-
-Once the secure tunnel is built, we speak **Google Protocol Buffers (Protobuf)**. Typical binary data (like C structs) breaks between different CPU architectures. Protobuf solves this by defining a strict schema.
-
-**The Envelope: `OfflineFrame`**
-Every message is wrapped in an `OfflineFrame` container.
-
-```protobuf
-message OfflineFrame {
-  // Protocol Version (Always 1)
-  optional int32 version = 1;
-
-  // The actual message inside
-  optional V1Frame v1 = 2; 
-}
-
-message V1Frame {
-  enum FrameType {
-    CONNECTION_REQUEST = 1;
-    PAIRED_KEY_ENCRYPTION_FRAME = 2;
-    PAYLOAD_TRANSFER = 3;
-  }
-  
-  optional ConnectionRequest connection_request = 4;
-  optional PayloadTransfer payload_transfer = 5;
-}
-```
-
-**Types of Messages:**
-1.  **ConnectionRequest**: "Hi, I am OmniShare. I want to send a file."
-2.  **PayloadTransfer**: "Here is chunk 1 of 100 of 'photo.jpg'."
-3.  **KeepAlive**: "Don't disconnect me, I'm still here."
+**Module:** `discovery/mdns_native.rs`
+*   Uses `mdns-sd` (a Rust implementation of mDNS).
+*   Manually constructs the binary buffers for the `n` record and Instance Name.
+*   Includes a "Self-Check" thread that browses for *our own service* to verify network visibility.
 
 ---
 
-## 🛠️ 5. Fallback Mechanisms
+## 5. The Graveyard of Failures (Post-Mortem Analysis)
 
-If the rigorous "Zero-Install" path fails (e.g., Google changes the encryption keys), we have a contingency plan.
+We failed many times to get here. Here is why.
 
-**The "Companion App" Approach:**
-*   We write a simple Android App (`OmniReceiver`).
-*   It opens a standard TCP Server on the phone.
-*   **Pros**: We control 100% of the code. No reverse engineering needed.
-*   **Cons**: The user must install the app (breaking "Zero-Install").
+### 5.1 The Service UUID Trap (0xFC9F vs 0xFE2C)
+*   **The Theory:** We saw `FC9F` everywhere in the docs. We assumed it was the Main UUID.
+*   **The Failure:** BLE scans yielded nothing.
+*   **The Truth:** `FC9F` is the *WiFi* service hash. `FE2C` is the *BLE* service UUID. They are totally different layers.
+*   **Severity:** Critical. Total blocker.
 
-Currently, we are succeeding with the Reverse Engineering path, so the app remains Plan B.
+### 5.2 The "Flags" Confusion in BlueZ
+*   **The Error:** `Failed to register application: Invalid definitions`.
+*   **The Cause:** We tried to pass a raw `flags: vec!["read"]` to `bluer`. BlueZ rejected it.
+*   **The Truth:** `bluer` infers flags based on which struct fields (`read`, `write`) are `Some(...)`. Explicit flags were forbidden and caused a parse error in the daemon.
 
----
+### 5.3 The Firewall Wall
+*   **The Symptom:** Everything looked perfect. Logs confirmed broadcast. Phone saw nothing.
+*   **The Cause:** Fedora's `firewalld` blocks UDP 5353 (mDNS) by default. The announcements were leaving the application but dying at the kernel network filter.
+*   **The Lesson:** Always check `sudo firewall-cmd --list-all`.
 
-## 🕵️ 6. Investigation Log: What We Tried (and Failed)
-
-Reverse engineering is rarely a straight line. Here is a technical summary of our "Dead Ends" and what they taught us.
-
-### Attempt 1: Bluetooth Classic (RFCOMM)
-**Hypothesis**: Maybe we can just pair with the phone like a headset and open a socket?
-**Experiment**:
-*   Ran `hcitool scan` to find the phone's MAC.
-*   Tried `sdptool browse` and `rfcomm connect`.
-**Result**: **Failure**.
-**Why?**: Modern Android does not keep its Bluetooth Classic radio discoverable. It relies on **BLE (Low Energy)** for the "Handshake" to save massive amounts of battery. You cannot just "connect" to a modern phone without waking it up first.
-
-### Attempt 2: "Random" BLE Payloads
-**Hypothesis**: The BLE trigger packet just needs to look *sort of* correct, and we should randomize it to look "fresh."
-**Experiment**:
-*   We filled the 20-byte payload with random noise.
-**Result**: **Failure (Ignored)**.
-**Why?**: The phone's Fast Pair service likely checks the "Salt" against a known schema or account key. While randomization prevents replay attacks, *too much* randomness without the correct header structure (`0xFC 0x12 0x8E...`) made the phone reject the packet as "Garbage/Noise."
-
-### Attempt 3: Firewall & mDNS
-**Hypothesis**: Once triggered, the phone is broadcasting, we just can't see it.
-**Experiment**:
-*   BLE Trigger was successful (phone woke up).
-*   `avahi-browse` returned nothing.
-**Result**: **Partial Failure**.
-**Why?**:
-1.  **Firewall**: Fedora's `firewalld` blocks UDP Port 5353 (mDNS) by default. We had to allow the `mdns` service.
-2.  **Network Isolation**: Discovery relies on Multicast. If devices are on different WiFi bands (2.4GHz vs 5GHz) or Guest Networks, routers often block these packets.
-
-### Attempt 4: The "Safe" BLE Native Payload (via `bluer`)
-**Goal**: Use the official Linux Bluetooth API (BlueZ via D-Bus) to broadcast the `0xFE2C` (Fast Pair) and `0xFC9F` (Nearby Sharing) services clearly.
-
-**The "Black Box" Problem**:
-While we know the Service UUIDs, the **Service Data Payload** (the ~20 bytes inside the packet) is undocumented. Android only wakes up if these bytes match a specific "Grammar."
-
-**We attempted 6 permutations of this grammar (Strategies v1-v6):**
-
-#### Strategy v1: The "Simple" Beacon
-*   **Payload**: `[0x00 (Visible)] + [Endpoint ID] + [Salt]`
-*   **Result**: Ignored.
-*   **Hypothesis**: Missing the "Identity Hash" field.
-
-#### Strategy v2: The "Status Bit" Guess
-*   **Payload**: `[0x20 (Visible?)] + [ID] + ...`
-*   **Result**: Ignored.
-*   **Hypothesis**: 0x20 is not the correct flag for "Visible".
-
-#### Strategy v3: Isolation
-*   **Payload**: Advertised *only* `0xFC9F` (Removing Fast Pair `0xFE2C`).
-*   **Result**: Ignored.
-*   **Hypothesis**: Android might *need* to see Fast Pair to even scan for the rest.
-
-#### Strategy v4: The "Kitchen Sink"
-*   **Payload**: `[Status] + [Salt] + [Null Hash] + [ID]` (Mixed order).
-*   **Result**: Ignored.
-
-#### Strategy v6: The "Standard Layout"
-*   **Payload**: `[Status 0x00] + [Endpoint ID] + [Salt] + [Hash]`
-*   **Logic**: In most protocols, the Context (ID) comes before the Content (Encrypted Hash).
-*   **Verification**: Used `sudo btmon` to PROVE packet is leaving the radio.
-    *   **Log**: `HCI Command: LE Set Extended Advertising Data ... Status: Success`.
-    *   **Conclusion**: The radio works. The specific **byte values** defined by Google are incorrect.
+### 5.4 The "Name" vs "Instance" Spec Violation
+*   **The Bug:** We named the service `OmniShare._FC9F...`.
+*   **The Result:** The phone ignored it.
+*   **The Detail:** The phone essentially does `if (!instance_name.matches(BASE64_PCP_REGEX)) return;`.
+*   **The Fix:** Changing the name to the ugly hash `BuY9f...` instantly fixed visibility.
 
 ---
 
-## 🔬 7. Research Request (The Missing Key)
+## 6. Future Roadmap: The Connection Phase
 
-We are currently blocked on the **Exact Byte Layout** of the `0xFC9F` Service Data.
-To succeed, we need to find code (likely Swift or Rust from `NearDrop` or `rquickshare`) that explicitly defines:
-1.  Is the Salt 2 bytes or 3 bytes?
-2.  Does the Endpoint ID come *before* or *after* the Salt?
-3.  What is the exact "Status Byte" for "Visible to Everyone"?
-4.  Is the Identity Hash required for anonymous advertising?
+Phase 1 (Discovery) is done. We are visible.
+Phase 2 (Connection) involves:
+1.  **Transport:** Accepting a TCP connection on port 5200.
+2.  **Authentication:** Implementing the **UKEY2** handshake (Diffie-Hellman Key Exchange) to establish a secure session key.
+3.  **Framing:** Decoding the Protobuf messages ("ConnectionRequestFrame") to accept the file transfer.
 
-**Next Step**: Locate `Advertiser.swift` or `service_data.rs` in open-source implementations to copy their homework.
+---
+*End of Guide - Phase 1*
