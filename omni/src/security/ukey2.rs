@@ -19,6 +19,16 @@ pub struct Ukey2ServerPending {
     _server_init_bytes: Vec<u8>, // Stored for v2 context
 }
 
+pub struct Ukey2SessionKeys {
+    pub auth_string: Vec<u8>,
+    pub d2d_client_key: Vec<u8>,
+    pub d2d_server_key: Vec<u8>,
+    pub decrypt_key: Vec<u8>,
+    pub receive_hmac_key: Vec<u8>,
+    pub encrypt_key: Vec<u8>,
+    pub send_hmac_key: Vec<u8>,
+}
+
 pub struct HandshakeResult {
     pub auth_string: Vec<u8>,
     pub d2d_client_key: Vec<u8>,
@@ -101,7 +111,7 @@ impl Ukey2Server {
 
 impl Ukey2ServerPending {
     /// Finish the handshake by processing ClientFinished and deriving keys.
-    pub fn handle_client_finished(self, client_finished_msg_data: &[u8]) -> Result<HandshakeResult> {
+    pub fn handle_client_finished(self, client_finished_msg_data: &[u8]) -> Result<Ukey2SessionKeys> {
          // 1. Decode ClientFinished
          let client_finished = Ukey2ClientFinished::decode(client_finished_msg_data)?;
          
@@ -131,7 +141,7 @@ impl Ukey2ServerPending {
             |key_material| key_material.to_vec(),
         ).map_err(|_| anyhow!("ECDH Agreement Failed"))?;
 
-        // 4. Derive UKEY2 Keys
+        // 4. Derive UKEY2 Keys (Phase 1: Master D2D Keys)
         let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]); 
         let prk = salt.extract(&shared_secret);
 
@@ -143,31 +153,66 @@ impl Ukey2ServerPending {
 
         let info_next = [b"UKEY2 v1 next".as_slice()];
         let okm_next = prk.expand(&info_next, hmac::HMAC_SHA256)
-             .map_err(|_| anyhow!("HKDF Expand Next Failed"))?;
+            .map_err(|_| anyhow!("HKDF Expand Next Protocol Failed"))?;
         let mut next_protocol_secret = vec![0u8; 32];
-        okm_next.fill(&mut next_protocol_secret).map_err(|_| anyhow!("HKDF Fill Next Failed"))?;
+        okm_next.fill(&mut next_protocol_secret).map_err(|_| anyhow!("HKDF Fill Next Protocol Failed"))?;
 
-        // 5. Derive D2D Keys
-        let d2d_salt_bytes = hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap();
-        let d2d_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &d2d_salt_bytes);
+        // --- DERIVATION PHASE 2: D2D KEYS (From Next Protocol Secret) ---
+        // Salt for D2D derivation
+        let d2d_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap());
         let d2d_prk = d2d_salt.extract(&next_protocol_secret);
 
-        // Client Key
         let info_client = [b"client".as_slice()];
-        let okm_client = d2d_prk.expand(&info_client, hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF D2D Client"))?;
+        let okm_client = d2d_prk.expand(&info_client, hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF D2D Client Failed"))?;
         let mut d2d_client_key = vec![0u8; 32];
-        okm_client.fill(&mut d2d_client_key).map_err(|_| anyhow!("HKDF Fill D2D Client"))?;
+        okm_client.fill(&mut d2d_client_key).map_err(|_| anyhow!("HKDF Fill D2D Client Failed"))?;
 
-        // Server Key
         let info_server = [b"server".as_slice()];
-        let okm_server = d2d_prk.expand(&info_server, hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF D2D Server"))?;
+        let okm_server = d2d_prk.expand(&info_server, hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF D2D Server Failed"))?;
         let mut d2d_server_key = vec![0u8; 32];
-        okm_server.fill(&mut d2d_server_key).map_err(|_| anyhow!("HKDF Fill D2D Server"))?;
+        okm_server.fill(&mut d2d_server_key).map_err(|_| anyhow!("HKDF Fill D2D Server Failed"))?;
 
-        Ok(HandshakeResult {
+        // --- DERIVATION PHASE 3: SECURE MESSAGE KEYS (AES & HMAC) ---
+        // "All four use the same value of salt, which is SHA256('SecureMessage')"
+        // BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E
+        let sm_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap());
+        
+        // SERVER (That's US): We ENCRYPT with Server Key, DECRYPT with Client Key.
+        // Wait, the doc says: "If you're the client, they need to be swapped... Decrypt/Receive should use Server Key".
+        // Since we are the SERVER:
+        // We DECRYPT messages from Client using D2D Client Key. 
+        // We ENCRYPT messages to Client using D2D Server Key.
+
+        // Decrypt Key (IKM = D2D Client Key, Info = "ENC:2")
+        let pt_decrypt = sm_salt.extract(&d2d_client_key);
+        let okm_decrypt = pt_decrypt.expand(&[b"ENC:2"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Decrypt Key Failed"))?;
+        let mut decrypt_key = vec![0u8; 32];
+        okm_decrypt.fill(&mut decrypt_key).map_err(|_| anyhow!("HKDF Fill Decrypt Key Failed"))?;
+
+        // Receive HMAC Key (IKM = D2D Client Key, Info = "SIG:1")
+        let okm_recv_hmac = pt_decrypt.expand(&[b"SIG:1"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Recv HMAC Key Failed"))?;
+        let mut receive_hmac_key = vec![0u8; 32];
+        okm_recv_hmac.fill(&mut receive_hmac_key).map_err(|_| anyhow!("HKDF Fill Recv HMAC Key Failed"))?;
+
+        // Encrypt Key (IKM = D2D Server Key, Info = "ENC:2")
+        let pt_encrypt = sm_salt.extract(&d2d_server_key);
+        let okm_encrypt = pt_encrypt.expand(&[b"ENC:2"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Encrypt Key Failed"))?;
+        let mut encrypt_key = vec![0u8; 32];
+        okm_encrypt.fill(&mut encrypt_key).map_err(|_| anyhow!("HKDF Fill Encrypt Key Failed"))?;
+
+        // Send HMAC Key (IKM = D2D Server Key, Info = "SIG:1")
+        let okm_send_hmac = pt_encrypt.expand(&[b"SIG:1"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Send HMAC Key Failed"))?;
+        let mut send_hmac_key = vec![0u8; 32];
+        okm_send_hmac.fill(&mut send_hmac_key).map_err(|_| anyhow!("HKDF Fill Send HMAC Key Failed"))?;
+
+        Ok(Ukey2SessionKeys {
             auth_string,
-            d2d_client_key,
-            d2d_server_key,
+            d2d_client_key, // Keeping these for debug logging, but effectively unused now
+            d2d_server_key, // Keeping these for debug logging
+            decrypt_key,
+            receive_hmac_key,
+            encrypt_key,
+            send_hmac_key,
         })
     }
 }

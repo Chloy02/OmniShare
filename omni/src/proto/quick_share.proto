@@ -88,4 +88,5 @@ message Disconnection {
 
 message PairedKeyEncryption {
   optional bytes signed_data = 1;
+  optional bytes secret_id_hash = 2;
 }

@@ -10,3 +10,8 @@ pub mod ukey2 {
     // package securegcm;
     include!(concat!(env!("OUT_DIR"), "/securegcm.rs"));
 }
+
+pub mod securemessage {
+    // package securemessage;
+    include!(concat!(env!("OUT_DIR"), "/securemessage.rs"));
+}
