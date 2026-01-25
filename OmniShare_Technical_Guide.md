@@ -240,16 +240,67 @@ During implementation, we encountered a .
 
 ---
 
-## 8. What's Next: The Cryptographic Reply (Phase 3)
+## 8. Part 3: The Cryptographic Handshake (UKEY2)
 
-We have successfully caught the . The connection drops now because we are rude—we don't reply.
+The "Standard" UKEY2 implementation (like the C++ reference) failed immediately. Android implements a specific, slightly non-standard flavor of UKEY2.
 
-**The UKEY2 State Machine:**
-1.  **Client:** Sends  (We have this).
-2.  **Server (Us):** Must send .
-    *   Generate a P-256 Keypair.
-    *   Compute Shared Secret (ECDH).
-    *   Derive AES-256 Session Keys (HKDF).
-3.  **Client:** Sends .
+### 8.1 The "Negative Integer" Crash (BigInts)
+The most critical discovery was a Java-specific failure.
+*   **The Issue:** We sent our P-256 Public Key (X and Y coordinates) as raw 32-byte arrays.
+*   **The Result:** Connection Reset.
+*   **The Cause:** Java's `BigInteger` interprets byte arrays as *Signed Two's Complement*. If the first bit of our random key happened to be `1`, Java read it as a negative number. P-256 coordinates cannot be negative.
+*   **The Fix:** We interpret the bytes. If the MSB is `1`, we prepend a `0x00` byte (padding), making it a 33-byte positive integer.
 
-**Current Status:** Ready to implement .
+### 8.2 The Key Derivation (HKDF)
+The handshake derives a 32-byte shared secret using ECDH-P256. From this, we derive the session keys using HKDF-SHA256.
+
+*   **Salt:** `"UKEY2 v1"` (string) for Auth/Next secrets. `82AA55A0...` (SHA256 of "D2D") for Device-to-Device keys.
+*   **Info Strings:**
+    *   `client` -> D2D Client Key
+    *   `server` -> D2D Server Key
+*   **The Role Swap:**
+    This is subtle. The keys are named "Client Key" and "Server Key".
+    *   The **Client** (Phone) *Encrypts* with the `Client Key` and *Decrypts* with the `Server Key`.
+    *   The **Server** (Us) *Encrypts* with the `Server Key` and *Decrypts* with the `Client Key`.
+    *Implementation Note:* We initially failed decryption because we tried to decrypt using the Server Key (our own key). We must decrypt using the key the *other* party used to encrypt.
+
+---
+
+## 9. Part 4: The Secure Message Layer
+
+Once keys are exchanged, the protocol switches modes *instantly*.
+
+### 9.1 The "SecureMessage" Wrapper
+Every subsequent packet is a `SecureMessage` protobuf (Google internal standard), not a raw buffer.
+
+```protobuf
+message SecureMessage {
+    required bytes header_and_body = 1; // Serialized HeaderAndBody
+    required bytes signature = 2;       // HMAC-SHA256 Signature
+}
+```
+
+*   **Encryption:** AES-256-CBC with PKCS7 Padding.
+*   **Signature:** HMAC-SHA256 covers the *Header*, the *Body* (Ciphertext), and the *Metadata*.
+
+### 9.2 The First Encrypted Frame: PairedKeyEncryption (PKE)
+Immediately after the handshake, both devices must prove they own the session keys. They exchange a `PairedKeyEncryption` frame.
+
+*   **The "Protocol Gap":** Public documentation suggests this frame is wrapped in a `PayloadTransfer`.
+*   **The Reality:** It is sent continuously as a top-level `V1Frame` (Type 7).
+*   **The Content:**
+    *   `secret_id_hash`: 6 Bytes.
+    *   `signed_data`: 72 Bytes.
+    *   **Crucial Fix:** In the standard proto, these are optional. But for Quick Share, they **MUST** be populated with random bytes of the exact lengths specified above. Sending empty fields causes the phone to disconnect.
+
+### 9.3 The Wire Sequence (Summary)
+1.  **Phone:** `ConnectionRequest` (Plaintext)
+2.  **Phone:** `Ukey2ClientInit` (Plaintext) -> We parse this.
+3.  **Us:** `Ukey2ServerInit` (Plaintext) -> Phone derives keys.
+4.  **Phone:** `Ukey2ClientFinished` (Plaintext) -> We derive keys.
+5.  **Us:** `ConnectionResponse` (Accept) (Plaintext).
+6.  **Phone:** `ConnectionResponse` (Accept) (Plaintext).
+7.  **Us:** `PairedKeyEncryption` (Encrypted `SecureMessage` > `DeviceToDeviceMessage` > `OfflineFrame`).
+8.  **Phone:** `PairedKeyEncryption` (Encrypted).
+
+*Current Status:* We have successfully reached Step 7 and are debugging the specific encryption parameters for Step 8.

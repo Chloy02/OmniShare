@@ -6,6 +6,27 @@ use sha2::Digest;
 pub struct ConnectionManager;
 
 impl ConnectionManager {
+    /// Connects TO a discovered phone (reverse connection)
+    pub async fn connect_to_phone(target: &str) -> Result<()> {
+        use tokio::net::TcpStream;
+        
+        println!("REVERSE: Connecting to phone at {}...", target);
+        
+        match TcpStream::connect(target).await {
+            Ok(mut socket) => {
+                println!("REVERSE: Connection established! Starting handshake...");
+                if let Err(e) = Self::handle_connection(&mut socket).await {
+                    eprintln!("REVERSE: Handshake failed: {}", e);
+                }
+                Ok(())
+            },
+            Err(e) => {
+                eprintln!("REVERSE: TCP connection failed: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
     /// Starts the TCP Listener on Port 5200 (Standard Quick Share Port)
     pub async fn start_server() -> Result<()> {
         let addr = "0.0.0.0:5200";
@@ -26,10 +47,6 @@ impl ConnectionManager {
         }
     }
 
-    /// Handles the connection lifecycle:
-    /// 1. Read 4-byte length prefix.
-    /// 2. Read Protobuf payload.
-    /// 3. Decode ConnectionRequest.
     /// Handles the connection lifecycle:
     /// 1. Loop to read Frames.
     /// 2. Decode ConnectionRequest.
@@ -156,8 +173,8 @@ impl ConnectionManager {
                                                   println!("TCP Handler: Sent ConnectionResponse! Switching to Encrypted Mode.");
 
                                                   let engine = crate::security::engine::SecurityEngine::new(
-                                                      &keys.d2d_client_key,
-                                                      &keys.d2d_server_key,
+                                                      &keys.decrypt_key,
+                                                      &keys.encrypt_key,
                                                       &keys.receive_hmac_key,
                                                       &keys.send_hmac_key,
                                                   );
@@ -180,16 +197,19 @@ impl ConnectionManager {
                                                   
                                                   println!("TCP Handler: Client Response received. Entering Secure Mode.");
                                                   
-                                                  // --- Step 4.6: Send PairedKeyEncryption (Encrypted) ---
+                                                  // --- Step 4.6: Send PairedKeyEncryption (Direct V1Packet) ---
                                                   println!("TCP Handler: Sending PairedKeyEncryption...");
                                                   
-                                                  // Calculate Secret ID Hash = SHA256(auth_string)
-                                                  let secret_id_hash = sha2::Sha256::digest(&keys.auth_string).to_vec();
-                                                  println!("TCP Handler: Secret ID Hash: {}", hex::encode(&secret_id_hash));
+                                                  // Per PROTOCOL.md line 206: "I set secretIDHash to 6 random bytes and signedData to 72 random bytes"
+                                                  use rand::Rng;
+                                                  let mut secret_id_hash = vec![0u8; 6];
+                                                  rand::thread_rng().fill(&mut secret_id_hash[..]);
+                                                  let mut signed_data = vec![0u8; 72];
+                                                  rand::thread_rng().fill(&mut signed_data[..]);
+                                                  println!("TCP Handler: Generated 6-byte secretIDHash and 72-byte signed_data");
                                                   
-                                                  // For Signed Data: We are unauthorized/guest, so we send None.
                                                   let pke = crate::proto::quick_share::PairedKeyEncryption {
-                                                      signed_data: None,
+                                                      signed_data: Some(signed_data),
                                                       secret_id_hash: Some(secret_id_hash),
                                                   };
                                                   let pke_frame_v1 = crate::proto::quick_share::V1Frame {
@@ -202,8 +222,10 @@ impl ConnectionManager {
                                                       v1: Some(pke_frame_v1),
                                                   };
                                                   
+                                                  // Serialize the PKE OfflineFrame
                                                   let mut pke_buf = Vec::new();
                                                   pke_offline_frame.encode(&mut pke_buf)?;
+                                                  
                                                   // Wrap in DeviceToDeviceMessage
                                                   let d2d_msg = crate::proto::ukey2::DeviceToDeviceMessage {
                                                       sequence_number: Some(1), 
@@ -219,15 +241,15 @@ impl ConnectionManager {
                                                   };
                                                   let mut meta_bytes = Vec::new();
                                                   gcm_meta.encode(&mut meta_bytes)?;
-
-                                                  // Encrypt this payload with the GcmMetadata in the header
+                                                  
+                                                  // Encrypt this payload
                                                   let encrypted_pke = engine.encrypt_and_sign(&d2d_buf, Some(&meta_bytes))?;
                                                   println!("TCP Handler: Encrypted PKE Frame size: {}", encrypted_pke.len());
                                                   
                                                   let pke_len_prefix = (encrypted_pke.len() as u32).to_be_bytes();
                                                   socket.write_all(&pke_len_prefix).await?;
                                                   socket.write_all(&encrypted_pke).await?;
-                                                  println!("TCP Handler: Sent Encrypted PairedKeyEncryption!");
+                                                  println!("TCP Handler: Sent Encrypted PairedKeyEncryption (Direct Type 7)!");
 
                                                   // Now we listen for the Client's encrypted reply
                                                   println!("TCP Handler: Listening for Client's Encrypted Frames...");
@@ -248,9 +270,6 @@ impl ConnectionManager {
                                                       match engine.verify_and_decrypt(&enc_buf) {
                                                           Ok(decrypted_payload) => {
                                                               println!("TCP Handler: 🔓 Decrypted successfully! {} bytes.", decrypted_payload.len());
-                                                              // Check if it is a SecureMessage (DeviceToDeviceMessage)
-                                                              // The payload of SecureMessage is usually a DeviceToDeviceMessage proto.
-                                                              // Let's decode it.
                                                               let d2d_msg = match crate::proto::ukey2::DeviceToDeviceMessage::decode(&decrypted_payload[..]) {
                                                                   Ok(m) => m,
                                                                   Err(e) => {
@@ -261,17 +280,72 @@ impl ConnectionManager {
                                                               
                                                               if let Some(inner_msg) = d2d_msg.message {
                                                                   println!("TCP Handler: Decoded D2D Message (Seq: {:?}). Processing inner OfflineFrame...", d2d_msg.sequence_number);
-                                                                  // Inner message is an OfflineFrame
                                                                   let frame = crate::proto::quick_share::OfflineFrame::decode(&inner_msg[..])?;
                                                                   if let Some(v1) = frame.v1 {
                                                                       println!("TCP Handler: Inner Frame Type: {:?}", v1.r#type);
-                                                                      if let Some(pke) = v1.paired_key_encryption {
-                                                                           println!("TCP Handler: 🔑 PAIRED_KEY_ENCRYPTION received! (Chunk size: {:?})", pke.signed_data.as_ref().map(|d| d.len()));
-                                                                           // We effectively ignore the validation for now as per "works fine" advice
-                                                                           // But we MUST send a reply? 
-                                                                           // According to doc: "After that, the client and the server send each other a 'paired key result' frame."
-                                                                           // TODO: Send PairedKeyResult
-                                                                      }
+                                                                       
+                                                                       if let Some(_pke) = v1.paired_key_encryption {
+                                                                            println!("TCP Handler: 🔑 Client's PAIRED_KEY_ENCRYPTION received!");
+                                                                            println!("TCP Handler: Sending AuthenticationResult (FAILURE/UNABLE)...");
+                                                                            
+                                                                            let auth_result = crate::proto::quick_share::AuthenticationResult {
+                                                                                status: Some(2), // FAILURE = UNABLE
+                                                                                auth_token: None,
+                                                                            };
+                                                                            let auth_frame = crate::proto::quick_share::V1Frame {
+                                                                                r#type: Some(crate::proto::quick_share::v1_frame::FrameType::AuthenticationResult.into()),
+                                                                                authentication_result: Some(auth_result),
+                                                                                ..Default::default()
+                                                                            };
+                                                                            let auth_offline = crate::proto::quick_share::OfflineFrame {
+                                                                                version: Some(1),
+                                                                                v1: Some(auth_frame),
+                                                                            };
+                                                                            
+                                                                            let mut auth_buf = Vec::new();
+                                                                            auth_offline.encode(&mut auth_buf)?;
+                                                                            
+                                                                            let d2d_auth = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                                sequence_number: Some(2),
+                                                                                message: Some(auth_buf),
+                                                                            };
+                                                                            let mut d2d_auth_buf = Vec::new();
+                                                                            d2d_auth.encode(&mut d2d_auth_buf)?;
+                                                                            
+                                                                            let gcm_meta = crate::proto::ukey2::GcmMetadata {
+                                                                                r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
+                                                                                version: Some(1),
+                                                                            };
+                                                                            let mut meta_bytes = Vec::new();
+                                                                            gcm_meta.encode(&mut meta_bytes)?;
+                                                                            
+                                                                            let encrypted_auth = engine.encrypt_and_sign(&d2d_auth_buf, Some(&meta_bytes))?;
+                                                                            let auth_len = (encrypted_auth.len() as u32).to_be_bytes();
+                                                                            socket.write_all(&auth_len).await?;
+                                                                            socket.write_all(&encrypted_auth).await?;
+                                                                            
+                                                                            println!("TCP Handler: Sent encrypted AuthenticationResult!");
+                                                                       }
+                                                                       else if let Some(auth_result) = v1.authentication_result {
+                                                                            println!("TCP Handler: 🔑 Client's AUTHENTICATION_RESULT received: {:?}", auth_result.status);
+                                                                       }
+                                                                       else if let Some(payload) = v1.payload_transfer {
+                                                                            println!("TCP Handler: 📥 PAYLOAD_TRANSFER received!");
+                                                                            if let Some(header) = payload.payload_header {
+                                                                                println!("TCP Handler: File: {:?}, Size: {:?} bytes", 
+                                                                                    header.file_name, header.total_size);
+                                                                            }
+                                                                       }
+                                                                       else if let Some(_ka) = v1.keep_alive {
+                                                                            println!("TCP Handler: 💓 KEEP_ALIVE received");
+                                                                       }
+                                                                       else if let Some(_dc) = v1.disconnection {
+                                                                            println!("TCP Handler: 👋 DISCONNECTION received - client closing");
+                                                                            break;
+                                                                       }
+                                                                       else {
+                                                                            println!("TCP Handler: ⚠️ Unknown frame type: {:?}", v1.r#type);
+                                                                       }
                                                                   }
                                                               }
                                                           },
@@ -279,13 +353,12 @@ impl ConnectionManager {
                                                               println!("TCP Handler: ⛔ Decryption Failed: {:?}", e);
                                                               println!("TCP Handler: RAW HEX: {}", hex::encode(&enc_buf));
                                                               
-                                                              // Debug: Is it plaintext?
+                                                              // Check for plaintext
                                                               match crate::proto::quick_share::OfflineFrame::decode(&enc_buf[..]) {
                                                                   Ok(f) => {
                                                                        println!("TCP Handler: ⚠️  IT IS PLAINTEXT! Type: {:?}", f.v1.as_ref().and_then(|v| v.r#type));
-                                                                       // If it's KeepAlive (5), maybe we just ignore it or handle it?
                                                                   },
-                                                                  Err(_) => println!("TCP Handler: Not plaintext either."),
+                                                                  Err(_) => {},
                                                               }
                                                           }
                                                       }

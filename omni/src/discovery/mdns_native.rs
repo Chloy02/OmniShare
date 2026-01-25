@@ -9,8 +9,9 @@ pub struct MdnsService {
 }
 
 impl MdnsService {
-    pub fn start(device_name: &str, port: u16) -> Result<Self> {
+    pub fn start(device_name: &str, port: u16, endpoint_id: &str) -> Result<Self> {
         println!("Starting mDNS Service for Quick Share...");
+        println!("Using Endpoint ID: {}", endpoint_id);
 
         // 1. Create the mDNS Daemon
         let mdns = ServiceDaemon::new().expect("Failed to create mDNS daemon");
@@ -52,14 +53,7 @@ impl MdnsService {
         // A. PCP Byte (0x23)
         let pcp: u8 = 0x23;
 
-        // B. Endpoint ID (4 random alphanumeric chars)
-        // We need these for the name construction AND potentially for the BLE payload (if we ever add it there).
-        let endpoint_id: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(4)
-            .map(char::from)
-            .collect();
-        println!("Generated Endpoint ID: {}", endpoint_id);
+        // B. Endpoint ID (passed from main - MUST match BLE)
 
         // C. Service ID (0xFC, 0x9F, 0x5E)
         let service_id = [0xFC, 0x9F, 0x5E];
@@ -110,7 +104,7 @@ impl MdnsService {
                         println!("Self-Check: FOUND SERVICE -> {}", info.get_fullname());
                         println!("Self-Check: IP: {:?}", info.get_addresses());
                         println!("Self-Check: Port: {}", info.get_port());
-                        // If we see this, the Firewall is Open and Code is Working.
+                        // Per PROTOCOL.md: Receiver is SERVER, waits for client to connect
                     },
                     _ => {}
                 }

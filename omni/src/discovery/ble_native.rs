@@ -31,28 +31,30 @@ pub struct BleService {
 
 impl BleService {
     /// Starts the specific BLE Advertisement AND GATT Service.
-    pub async fn start() -> Result<Self> {
+    pub async fn start(endpoint_id: String) -> Result<Self> {
         let session = Session::new().await.context("Failed to connect to BlueZ")?;
         let adapter = session.default_adapter().await.context("No Bluetooth adapter found")?;
         
         println!("Bluetooth Adapter: {}", adapter.name());
         adapter.set_powered(true).await.context("Failed to power on adapter")?;
 
-        // 1. Register GATT Service (The "Menu")
-        // Android scans 0xFE2C, then connects to checking for these characteristics.
+        // 1. Register GATT Service (Fast Pair Verification)
+        // Android requires BLE GATT connection to verify Model ID before TCP
         println!("Registering GATT Service (0xFE2C)...");
         let app = Application {
             services: vec![Service {
                 uuid: Uuid::from_u16(FAST_PAIR_SERVICE_UUID),
                 primary: true,
                 characteristics: vec![
-                    // Model ID (Read-only stub)
+                    // Model ID (Read-only)
                     Characteristic {
                         uuid: MODEL_ID_UUID,
                         read: Some(CharacteristicRead {
-                            read: true, // <--- CRITICAL: Enables "Read" flag
+                            read: true,
                             fun: Box::new(|_| Box::pin(async {
-                                Ok(vec![0x00, 0x00, 0x01]) // Dummy Model ID
+                                println!("GATT: Phone reading Model ID...");
+                                // MUST match advertised Model ID
+                                Ok(vec![0xFC, 0x12, 0x8E])
                             })),
                             ..Default::default()
                         }),
@@ -62,18 +64,17 @@ impl BleService {
                     Characteristic {
                         uuid: KEY_BASED_PAIRING_UUID,
                         write: Some(CharacteristicWrite {
-                            write: true, // <--- CRITICAL: Enables "Write" flag
+                            write: true,
                             method: CharacteristicWriteMethod::Fun(Box::new(|new_value, _| Box::pin(async move {
-                                println!("Remote wrote to Key-based Pairing: {:?}", new_value);
+                                println!("GATT: Remote wrote to Key-based Pairing: {:?}", new_value);
                                 Ok(())
                             }))),
                             ..Default::default()
                         }),
                         notify: Some(CharacteristicNotify {
-                            notify: true, // <--- CRITICAL: Enables "Notify" flag
+                            notify: true,
                             method: CharacteristicNotifyMethod::Fun(Box::new(|_| Box::pin(async {
-                                // Notification subscription handler
-                                println!("Remote subscribed to notifications");
+                                println!("GATT: Remote subscribed to notifications");
                             }))),
                             ..Default::default()
                         }),
@@ -84,41 +85,41 @@ impl BleService {
             }],
             ..Default::default()
         };
+
         let app_handle = adapter.serve_gatt_application(app).await
             .context("Failed to register GATT application")?;
 
         // 2. Register Advertisement (The "Sign")
-        // Generate Session Endpoint ID (4 chars) - Used for mDNS later
-        let endpoint_id: String = thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(4)
-            .map(char::from)
-            .collect();
+        // Endpoint ID passed from main (MUST match mDNS)
+        println!("Using Shared Endpoint ID: {}", endpoint_id);
+
+        // Construct 24-byte Quick Share "Trigger" Payload
+        // PROTOCOL.MD Line 56: fc 12 8e 01 42 00 00 00 00 00 00 00 00 00 [10 random bytes]
+        // CRITICAL: The 9 zero bytes are MANDATORY, not optional!
+        let mut service_data_payload = Vec::with_capacity(24);
         
-        println!("Generated Session Endpoint ID: {}", endpoint_id);
+        // Header (5 bytes)
+        service_data_payload.push(0xFC);  // Model ID byte 1
+        service_data_payload.push(0x12);  // Model ID byte 2
+        service_data_payload.push(0x8E);  // Model ID byte 3
+        service_data_payload.push(0x01);  // OpCode
+        service_data_payload.push(0x42);  // Meta
+        
+        // MANDATORY: 9 zero bytes padding (PROTOCOL.md compliance)
+        service_data_payload.extend_from_slice(&[0x00; 9]);
 
-        // Construct 15-byte Quick Share "Trigger" Payload
-        // Header: [0xFC, 0x12, 0x8E] (Model ID) + [0x01] (OpCode) + [0x42] (Meta)
-        let mut service_data_payload = Vec::with_capacity(15);
-        service_data_payload.push(0xFC);
-        service_data_payload.push(0x12);
-        service_data_payload.push(0x8E);
-        service_data_payload.push(0x01);
-        service_data_payload.push(0x42);
-
-        // Salt: 10 Bytes of Randomness
+        // Salt: 10 random bytes
         let salt: [u8; 10] = thread_rng().gen(); 
         service_data_payload.extend_from_slice(&salt);
-        println!("Generated Payload (15 bytes): {:02X?}", service_data_payload);
+        println!("Generated Payload (24 bytes): {:02X?}", service_data_payload);
 
         let mut service_data = BTreeMap::new();
-        // The Key MUST be 0xFE2C (Fast Pair)
         let fast_pair_uuid = Uuid::from_u16(FAST_PAIR_SERVICE_UUID);
         service_data.insert(fast_pair_uuid, service_data_payload);
 
         let le_advertisement = Advertisement {
             service_data,
-            discoverable: Some(true),
+            discoverable: Some(true), // MUST be connectable for GATT
             min_interval: Some(Duration::from_millis(100)),
             max_interval: Some(Duration::from_millis(100)),
             ..Default::default()
@@ -126,7 +127,7 @@ impl BleService {
 
         println!("Registering LE Advertisement...");
         let handle = adapter.advertise(le_advertisement).await
-            .context("Failed to register advertisement. Is bluetoothd running?")?;
+            .context("Failed to register advertisement")?;
 
         println!("Success! Advertising as 'OmniShare' (ID: {}).", endpoint_id);
         println!("Android phones should now see a 'Device Nearby' notification (if close).");
@@ -139,8 +140,8 @@ impl BleService {
 }
 
 /// Helper to keep the process alive while advertising
-pub async fn run_forever() -> Result<()> {
-    let _service = BleService::start().await?;
+pub async fn run_forever(endpoint_id: String) -> Result<()> {
+    let _service = BleService::start(endpoint_id).await?;
     
     // Keep alive
     loop {
