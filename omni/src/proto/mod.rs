@@ -15,3 +15,8 @@ pub mod securemessage {
     // package securemessage;
     include!(concat!(env!("OUT_DIR"), "/securemessage.rs"));
 }
+
+pub mod wire_format {
+    // package sharing.nearby;
+    include!(concat!(env!("OUT_DIR"), "/sharing.nearby.rs"));
+}

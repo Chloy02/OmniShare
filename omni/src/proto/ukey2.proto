@@ -40,9 +40,15 @@ message GenericPublicKey {
 message Ukey2ClientInit {
   optional int32 version = 1;
   optional bytes random = 2;
-  // The next_protocol string is "AES_256_CBC-HMAC_SHA256" typically
-  optional bytes next_protocol = 3; 
-  repeated Ukey2HandshakeCipher cipher_commitments = 4;
+  // Field 3: List of Cipher Commitments (Message)
+  repeated CipherCommitment cipher_commitments = 3;
+  // Field 4: Next Protocol String (Bytes)
+  optional bytes next_protocol = 4;
+}
+
+message CipherCommitment {
+  optional int32 handshake_cipher = 1;
+  optional bytes random = 2;
 }
 
 message Ukey2ServerInit {

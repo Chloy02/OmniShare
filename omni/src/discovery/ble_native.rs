@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::time::sleep;
 use rand::{Rng, thread_rng};
-use rand::distributions::Alphanumeric;
+
 use anyhow::{Context, Result};
 use uuid::Uuid;
 

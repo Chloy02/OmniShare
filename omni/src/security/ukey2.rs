@@ -29,6 +29,7 @@ pub struct Ukey2SessionKeys {
     pub send_hmac_key: Vec<u8>,
 }
 
+#[allow(dead_code)]
 pub struct HandshakeResult {
     pub auth_string: Vec<u8>,
     pub d2d_client_key: Vec<u8>,
@@ -54,11 +55,23 @@ impl Ukey2Server {
     }
 
     /// Process ClientInit, Generate ServerInit, and transition to Pending state.
-    pub fn handle_client_init(self, client_init_msg_data: &[u8]) -> Result<(Vec<u8>, Ukey2ServerPending)> {
-        // 1. Decode ClientInit just to validate it
-        let _client_init = Ukey2ClientInit::decode(client_init_msg_data)?;
+    // NOTE: client_init_outer_bytes must be the raw Ukey2Message (packet 2) from the wire.
+    pub fn handle_client_init(self, client_init_outer_bytes: &[u8]) -> Result<(Vec<u8>, Ukey2ServerPending)> {
+        // 1. Decode Outer Ukey2Message
+        let ukey_msg = Ukey2Message::decode(client_init_outer_bytes)?;
+        let client_init_data = ukey_msg.message_data.ok_or(anyhow!("Missing message_data in ClientInit"))?;
         
-        // 2. Construct ServerInit with EcP256PublicKey
+        // 2. Decode Inner ClientInit
+        let client_init = Ukey2ClientInit::decode(client_init_data.as_slice())?;
+        println!("UKEY2: Received ClientInit. Version: {:?}", client_init.version);
+        for (i, commitment) in client_init.cipher_commitments.iter().enumerate() {
+            println!("UKEY2: Commitment {}: Cipher={:?}", i, commitment.handshake_cipher);
+        }
+        if let Some(np) = &client_init.next_protocol {
+            println!("UKEY2: Next Protocol: {:?} (String: {:?})", np, String::from_utf8_lossy(np));
+        }
+
+        // 3. Construct ServerInit with EcP256PublicKey
         // my_public_key_bytes is 65 bytes: [0x04, X (32 bytes), Y (32 bytes)]
         if self.my_public_key_bytes.len() != 65 {
             return Err(anyhow!("Invalid Public Key Length"));
@@ -76,7 +89,7 @@ impl Ukey2Server {
             ec_p256_public_key: Some(ec_key),
         };
 
-        // Fix for rand::generate: specify type array [u8; 16] - Wait, used u8;32 before?
+        // Fix for rand::generate: specify type array [u8; 32]
         let rng = rand::SystemRandom::new();
         let random_bytes: [u8; 32] = rand::generate(&rng)
             .map_err(|_| anyhow!("Random gen failed"))?
@@ -101,10 +114,10 @@ impl Ukey2Server {
         let mut reply_buf = Vec::new();
         ukey2_reply.encode(&mut reply_buf)?;
 
-        Ok((reply_buf, Ukey2ServerPending {
+        Ok((reply_buf.clone(), Ukey2ServerPending {
             my_private_key: self.my_private_key,
-            _client_init_bytes: client_init_msg_data.to_vec(),
-            _server_init_bytes: server_init_buf,
+            _client_init_bytes: client_init_outer_bytes.to_vec(), // Store OUTER Bytes
+            _server_init_bytes: reply_buf, // Store OUTER Bytes
         }))
     }
 }
@@ -141,18 +154,29 @@ impl Ukey2ServerPending {
             |key_material| key_material.to_vec(),
         ).map_err(|_| anyhow!("ECDH Agreement Failed"))?;
 
-        // 4. Derive UKEY2 Keys (Phase 1: Master D2D Keys)
-        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]); 
-        let prk = salt.extract(&shared_secret);
-
-        let info_auth = [b"UKEY2 v1 auth".as_slice()];
-        let okm_auth = prk.expand(&info_auth, hmac::HMAC_SHA256)
+        // 4. Derive UKEY2 Keys (Phase 1: Auth String and Next Protocol Secret)
+        // Per Google UKEY2 spec: https://github.com/google/ukey2
+        // PRK_AUTH = HKDF-Extract("UKEY2 v1 auth", DHS)
+        // AUTH_STRING = HKDF-Expand(PRK_AUTH, M_1|M_2, L_auth)
+        
+        // Build transcript: M_1|M_2 (ClientInit | ServerInit)
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(&self._client_init_bytes);
+        transcript.extend_from_slice(&self._server_init_bytes);
+        let transcript_slice = [transcript.as_slice()];
+        
+        // Derive Auth String
+        let salt_auth = hkdf::Salt::new(hkdf::HKDF_SHA256, b"UKEY2 v1 auth");
+        let prk_auth = salt_auth.extract(&shared_secret);
+        let okm_auth = prk_auth.expand(&transcript_slice, hmac::HMAC_SHA256)
             .map_err(|_| anyhow!("HKDF Expand Auth Failed"))?;
         let mut auth_string = vec![0u8; 32];
         okm_auth.fill(&mut auth_string).map_err(|_| anyhow!("HKDF Fill Auth Failed"))?;
 
-        let info_next = [b"UKEY2 v1 next".as_slice()];
-        let okm_next = prk.expand(&info_next, hmac::HMAC_SHA256)
+        // Derive Next Protocol Secret
+        let salt_next = hkdf::Salt::new(hkdf::HKDF_SHA256, b"UKEY2 v1 next");
+        let prk_next = salt_next.extract(&shared_secret);
+        let okm_next = prk_next.expand(&transcript_slice, hmac::HMAC_SHA256)
             .map_err(|_| anyhow!("HKDF Expand Next Protocol Failed"))?;
         let mut next_protocol_secret = vec![0u8; 32];
         okm_next.fill(&mut next_protocol_secret).map_err(|_| anyhow!("HKDF Fill Next Protocol Failed"))?;
