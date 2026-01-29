@@ -24,6 +24,8 @@ message V1Frame {
     CERTIFICATE_INFO = 5;
     CANCEL = 6;
     PROGRESS_UPDATE = 7;
+    // Frame Types 8-11 are likely different updates or negotiations
+    KEEP_ALIVE = 12; // Inferred from logs & "screen off" behavior
   }
 
   optional FrameType type = 1;
@@ -32,6 +34,26 @@ message V1Frame {
   optional ConnectionResponseFrame connection_response = 3;
   optional PairedKeyEncryptionFrame paired_key_encryption = 4;
   optional PairedKeyResultFrame paired_key_result = 5;
+  optional CertificateInfoFrame certificate_info = 6;
+  optional KeepAliveFrame keep_alive = 7; // Matching usage for type 12 (KeepAlive)
+}
+
+message CertificateInfoFrame {
+  repeated PublicCertificate public_certificate = 1;
+}
+
+message PublicCertificate {
+  optional bytes secret_id = 1;
+  optional bytes authenticity_key = 2;
+  optional bytes public_key = 3;
+  optional int64 start_time = 4;
+  optional int64 end_time = 5;
+  optional bytes encrypted_metadata_bytes = 6;
+  optional bytes metadata_encryption_key_tag = 7;
+}
+
+message KeepAliveFrame {
+  optional bool ack = 1;
 }
 
 message IntroductionFrame {

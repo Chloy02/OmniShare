@@ -315,84 +315,182 @@ impl ConnectionManager {
                                                                   println!("TCP Handler: Decoded D2D Message (Seq: {:?}). Processing inner Sharing Frame...", d2d_msg.sequence_number);
                                                                   
                                                                   // TRY DECODING AS WIRE_FORMAT FRAME (Sharing Frame)
+                                                                  let mut decoded_sharing_frame: Option<crate::proto::wire_format::Frame> = None;
+
+                                                                  // Strategy 1: Direct Decoding
                                                                   match crate::proto::wire_format::Frame::decode(&inner_msg[..]) {
                                                                       Ok(frame) => {
-                                                                          if let Some(v1) = frame.v1 {
-                                                                               println!("TCP Handler: Inner Sharing Frame Type: {:?}", v1.r#type);
-                                                                               
-                                                                               if let Some(_pke) = v1.paired_key_encryption {
-                                                                                   println!("TCP Handler: 🔑 Client's PAIRED_KEY_ENCRYPTION received!");
-                                                                                   
-                                                                                   // Send PairedKeyResult (Status: UNABLE) because we don't support true pairing yet
-                                                                                   println!("TCP Handler: Sending PairedKeyResult (UNABLE)...");
-                                                                                   
-                                                                                   let pkr = crate::proto::wire_format::PairedKeyResultFrame {
-                                                                                       status: Some(crate::proto::wire_format::paired_key_result_frame::Status::Unable.into()),
-                                                                                   };
-                                                                                   
-                                                                                   let pkr_frame_v1 = crate::proto::wire_format::V1Frame {
-                                                                                       r#type: Some(crate::proto::wire_format::v1_frame::FrameType::PairedKeyResult.into()),
-                                                                                       paired_key_result: Some(pkr),
-                                                                                       ..Default::default()
-                                                                                   };
-                                                                                   
-                                                                                   let pkr_sharing_frame = crate::proto::wire_format::Frame {
-                                                                                       version: Some(crate::proto::wire_format::frame::Version::V1.into()),
-                                                                                       v1: Some(pkr_frame_v1),
-                                                                                   };
-                                                                                   
-                                                                                   let mut pkr_buf = Vec::new();
-                                                                                   pkr_sharing_frame.encode(&mut pkr_buf)?;
-                                                                                   
-                                                                                   let d2d_pkr = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                       sequence_number: Some(2), 
-                                                                                       message: Some(pkr_buf),
-                                                                                   };
-                                                                                   let mut d2d_pkr_buf = Vec::new();
-                                                                                   d2d_pkr.encode(&mut d2d_pkr_buf)?;
-                                                                                   
-                                                                                   let gcm_meta = crate::proto::ukey2::GcmMetadata {
-                                                                                       r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
-                                                                                       version: Some(1),
-                                                                                   };
-                                                                                   let mut meta_bytes = Vec::new();
-                                                                                   gcm_meta.encode(&mut meta_bytes)?;
-                                                                                   
-                                                                                   let encrypted_pkr = engine.encrypt_and_sign(&d2d_pkr_buf, Some(&meta_bytes))?;
-                                                                                   let len_prefix = (encrypted_pkr.len() as u32).to_be_bytes();
-                                                                                   socket.write_all(&len_prefix).await?;
-                                                                                   socket.write_all(&encrypted_pkr).await?;
-                                                                                   
-                                                                                   println!("TCP Handler: Sent Encrypted PairedKeyResult (UNABLE)!");
-                                                                               }
-                                                                               else if let Some(pkr) = v1.paired_key_result {
-                                                                                    println!("TCP Handler: 🔑 Client's PAIRED_KEY_RESULT received: {:?}", pkr.status);
-                                                                               }
-                                                                               else if let Some(intro) = v1.introduction {
-                                                                                    println!("TCP Handler: 📜 INTRODUCTION received! File count: {}", intro.file_metadata.len());
-                                                                               }
-                                                                               // Removed 'cancel' check as it is not defined in wire_format.proto definition yet
-                                                                               else {
-                                                                                    // Check for other types if needed, or just log generic
-                                                                                    println!("TCP Handler: ⚠️ Unknown or Unhandled Sharing Frame Type: {:?}", v1.r#type);
-                                                                               }
-                                                                          }
+                                                                           println!("TCP Handler: Strategy 1 (Direct) Success.");
+                                                                           decoded_sharing_frame = Some(frame);
                                                                       },
-                                                                      Err(_) => {
-                                                                          println!("TCP Handler: Failed to decode as Sharing Frame. Trying OfflineFrame (fallback)...");
-                                                                           if let Ok(frame) = crate::proto::quick_share::OfflineFrame::decode(&inner_msg[..]) {
-                                                                              if let Some(v1) = frame.v1 {
-                                                                                  println!("TCP Handler: Inner OfflineFrame Type: {:?}", v1.r#type);
-                                                                                  if let Some(payload) = v1.payload_transfer {
-                                                                                      println!("TCP Handler: 📥 PAYLOAD_TRANSFER received (OfflineFrame)!");
-                                                                                      if let Some(header) = payload.payload_header {
-                                                                                          println!("TCP Handler: File: {:?}, Size: {:?} bytes", 
-                                                                                              header.file_name, header.total_size);
-                                                                                      }
-                                                                                  }
+                                                                      Err(_e) => {
+                                                                           // Log failure but don't spam if it's actually wrapped
+                                                                           println!("TCP Handler: Strategy 1 Failed: {}", _e);
+                                                                      }
+                                                                  }
+                                                                  
+                                                                  if decoded_sharing_frame.is_none() {
+                                                                      // Strategy 2: Unwrap from OfflineFrame (PayloadTransfer)
+                                                                      println!("TCP Handler: RAW HEX (Decrypted D2D Msg): {}", hex::encode(&inner_msg));
+                                                                      match crate::proto::quick_share::OfflineFrame::decode(&inner_msg[..]) {
+                                                                          Ok(offline_frame) => {
+                                                                              println!("TCP Handler: Strategy 2: Decoded OfflineFrame.");
+                                                                              if let Some(v1_offline) = offline_frame.v1 {
+                                                                                   // Check for PAYLOAD_TRANSFER (Type 3)
+                                                                                   println!("TCP Handler: OfflineFrame Type: {:?}", v1_offline.r#type);
+                                                                                   if v1_offline.r#type == Some(3) { // FrameType::PayloadTransfer
+                                                                                       if let Some(pt) = v1_offline.payload_transfer {
+                                                                                           // Log Header Details
+                                                                                           if let Some(header) = &pt.payload_header {
+                                                                                               println!("TCP Handler: PayloadHeader -> Type: {:?}, ID: {:?}, Size: {:?}, Sensitive: {:?}", 
+                                                                                                    header.r#type, header.id, header.total_size, header.is_sensitive);
+                                                                                           } else {
+                                                                                               println!("TCP Handler: PayloadHeader is None");
+                                                                                           }
+                                                                                           
+                                                                                           // Log Chunk Details
+                                                                                           if let Some(chunk) = pt.payload_chunk {
+                                                                                               println!("TCP Handler: PayloadChunk -> Flags: {:?}, Offset: {:?}, Body Len: {:?}", 
+                                                                                                    chunk.flags, chunk.offset, chunk.body.as_ref().map(|b| b.len()));
+
+                                                                                               if let Some(body) = chunk.body {
+                                                                                                   println!("TCP Handler: Found Payload Body ({} bytes). Attempting unwrap...", body.len());
+                                                                                                   // Recursively attempt to decode the body as a Sharing Frame
+                                                                                                   match crate::proto::wire_format::Frame::decode(&body[..]) {
+                                                                                                       Ok(inner_sharing) => {
+                                                                                                           println!("TCP Handler: 📦 Unwrapped SharingFrame from PayloadTransfer!");
+                                                                                                           decoded_sharing_frame = Some(inner_sharing);
+                                                                                                       },
+                                                                                                       Err(e) => {
+                                                                                                           println!("TCP Handler: ⚠️ Failed to decode inner body as SharingFrame: {}", e);
+                                                                                                           println!("TCP Handler: 📥 Received File/Data Chunk ({} bytes)", body.len());
+                                                                                                           // Log raw body for debugging
+                                                                                                           println!("    -> Body Hex: {}", hex::encode(&body));
+                                                                                                       }
+                                                                                                   }
+                                                                                               } else {
+                                                                                                   println!("TCP Handler: PayloadChunk body is None");
+                                                                                               }
+                                                                                           } else {
+                                                                                               println!("TCP Handler: PayloadChunk is None");
+                                                                                           }
+                                                                                       } else {
+                                                                                           println!("TCP Handler: PayloadTransfer field is None");
+                                                                                       }
+                                                                                   } else {
+                                                                                       println!("TCP Handler: Inner OfflineFrame Type NOT PayloadTransfer (3). Is: {:?}", v1_offline.r#type);
+                                                                                   }
+                                                                              } else {
+                                                                                  println!("TCP Handler: OfflineFrame.v1 is None");
                                                                               }
+                                                                          },
+                                                                          Err(e) => {
+                                                                              println!("TCP Handler: Strategy 2 (OfflineFrame) Failed: {}", e);
+                                                                              println!("TCP Handler: ⚠️ Failed to decode 41-byte frame. Type unknown.");
+                                                                              println!("TCP Handler: RAW HEX (Inner D2D): {}", hex::encode(&inner_msg));
                                                                           }
                                                                       }
+                                                                  }
+
+                                                                  if let Some(frame) = decoded_sharing_frame {
+                                                                      let v1 = frame.v1.unwrap_or_default();
+                                                                      let frame_type = v1.r#type.unwrap_or(0);
+                                                                      
+                                                                      println!("TCP Handler: ✨ SHARING FRAME TYPE: {:?}", frame_type);
+
+                                                                      if frame_type == 3 { // PAIRED_KEY_ENCRYPTION
+                                                                           println!("TCP Handler: 🔑 Client's PAIRED_KEY_ENCRYPTION received!");
+                                                                           // Send PairedKeyResult (Status: UNABLE)
+                                                                           println!("TCP Handler: Sending PairedKeyResult (UNABLE)...");
+                                                                           let pkr = crate::proto::wire_format::PairedKeyResultFrame {
+                                                                               status: Some(crate::proto::wire_format::paired_key_result_frame::Status::Unable.into()),
+                                                                               ..Default::default()
+                                                                           };
+                                                                           let pkr_frame_v1 = crate::proto::wire_format::V1Frame {
+                                                                               r#type: Some(crate::proto::wire_format::v1_frame::FrameType::PairedKeyResult.into()),
+                                                                               paired_key_result: Some(pkr),
+                                                                               ..Default::default()
+                                                                           };
+                                                                           let pkr_sharing_frame = crate::proto::wire_format::Frame {
+                                                                               version: Some(crate::proto::wire_format::frame::Version::V1.into()),
+                                                                               v1: Some(pkr_frame_v1),
+                                                                           };
+                                                                           
+                                                                           let mut pkr_buf = Vec::new();
+                                                                           pkr_sharing_frame.encode(&mut pkr_buf)?;
+                                                                           
+                                                                           let d2d_pkr = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                               sequence_number: Some(2), 
+                                                                               message: Some(pkr_buf),
+                                                                           };
+                                                                           let mut d2d_pkr_buf = Vec::new();
+                                                                           d2d_pkr.encode(&mut d2d_pkr_buf)?;
+                                                                           
+                                                                           let gcm_meta = crate::proto::ukey2::GcmMetadata {
+                                                                               r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
+                                                                               version: Some(1),
+                                                                           };
+                                                                           let mut meta_bytes = Vec::new();
+                                                                           gcm_meta.encode(&mut meta_bytes)?;
+                                                                           
+                                                                           let encrypted_pkr = engine.encrypt_and_sign(&d2d_pkr_buf, Some(&meta_bytes))?;
+                                                                           let len_prefix = (encrypted_pkr.len() as u32).to_be_bytes();
+                                                                           socket.write_all(&len_prefix).await?;
+                                                                           socket.write_all(&encrypted_pkr).await?;
+                                                                           println!("TCP Handler: Sent Encrypted PairedKeyResult (UNABLE)!");
+
+                                                                      } else if frame_type == 4 { // PAIRED_KEY_RESULT
+                                                                           println!("TCP Handler: 🔑 Client's PAIRED_KEY_RESULT received!");
+                                                                           if let Some(pkr) = v1.paired_key_result {
+                                                                               println!("    -> Status: {:?}", pkr.status);
+                                                                           }
+                                                                      } else if frame_type == 1 { // INTRODUCTION
+                                                                           if let Some(intro) = v1.introduction {
+                                                                               println!("TCP Handler: 📜 INTRODUCTION received! File count: {}", intro.file_metadata.len());
+                                                                           }
+                                                                      } else if frame_type == 12 { // KEEP_ALIVE
+                                                                           println!("TCP Handler: 💓 Received KEEP_ALIVE, responding with ack...");
+                                                                           // Need to send a KeepAlive ack?
+                                                                            let ka = crate::proto::wire_format::KeepAliveFrame { ack: Some(true) };
+                                                                            let ka_v1 = crate::proto::wire_format::V1Frame {
+                                                                                r#type: Some(crate::proto::wire_format::v1_frame::FrameType::KeepAlive.into()),
+                                                                                keep_alive: Some(ka),
+                                                                                ..Default::default()
+                                                                            };
+                                                                            let ka_frame = crate::proto::wire_format::Frame {
+                                                                                version: Some(crate::proto::wire_format::frame::Version::V1.into()),
+                                                                                v1: Some(ka_v1),
+                                                                            };
+                                                                            let mut ka_buf = Vec::new();
+                                                                            ka_frame.encode(&mut ka_buf)?;
+                                                                            
+                                                                            let d2d_ka = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                                sequence_number: Some(999), 
+                                                                                message: Some(ka_buf),
+                                                                            };
+                                                                            let mut ka_enc_buf = Vec::new();
+                                                                            d2d_ka.encode(&mut ka_enc_buf)?;
+                                                                            
+                                                                            let gcm_meta = crate::proto::ukey2::GcmMetadata {
+                                                                                r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
+                                                                                 version: Some(1),
+                                                                             };
+                                                                             let mut meta_bytes = Vec::new();
+                                                                             gcm_meta.encode(&mut meta_bytes)?;
+
+                                                                             let encrypted_ka = engine.encrypt_and_sign(&ka_enc_buf, Some(&meta_bytes))?;
+                                                                             let len_prefix = (encrypted_ka.len() as u32).to_be_bytes();
+                                                                             socket.write_all(&len_prefix).await?;
+                                                                             socket.write_all(&encrypted_ka).await?;
+                                                                             println!("TCP Handler: Sent KEEP_ALIVE Ack.");
+                                                                      } else if frame_type == 6 { // CANCEL
+                                                                           println!("TCP Handler: ❌ Received CANCEL from client.");
+                                                                      } else {
+                                                                           println!("TCP Handler: ⚠️ Unhandled Sharing Frame Type: {}", frame_type);
+                                                                      }
+                                                                  } else {
+                                                                      // Fallback or explicit failure log
+                                                                      // Already logged errors above
                                                                   }
                                                               }
                                                           },

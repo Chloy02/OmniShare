@@ -154,6 +154,10 @@ impl Ukey2ServerPending {
             |key_material| key_material.to_vec(),
         ).map_err(|_| anyhow!("ECDH Agreement Failed"))?;
 
+        // UKEY2 v1 requires SHA256 hash of the raw ECDH shared secret
+        use sha2::{Digest, Sha256};
+        let shared_secret = Sha256::digest(&shared_secret).to_vec();
+
         // 4. Derive UKEY2 Keys (Phase 1: Auth String and Next Protocol Secret)
         // Per Google UKEY2 spec: https://github.com/google/ukey2
         // PRK_AUTH = HKDF-Extract("UKEY2 v1 auth", DHS)
