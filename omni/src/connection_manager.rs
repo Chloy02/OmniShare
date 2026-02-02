@@ -363,6 +363,15 @@ impl ConnectionManager {
                                                   // Now we listen for the Client's encrypted reply
                                                   println!("TCP Handler: Listening for Client's Encrypted Frames...");
                                                   // Read loop for secure messages
+                                                  
+                                                  // File transfer state tracking
+                                                  use std::collections::HashMap;
+                                                  
+                                                  // Maps payload_id -> (filename, expected_size)
+                                                  let mut file_metadata_map: HashMap<i64, (String, i64)> = HashMap::new();
+                                                  // Maps payload_id -> accumulated bytes
+                                                  let mut file_buffers: HashMap<i64, Vec<u8>> = HashMap::new();
+                                                  
                                                   loop {
                                                       let mut length_buf = [0u8; 4];
                                                       if let Err(_) = socket.read_exact(&mut length_buf).await {
@@ -433,19 +442,100 @@ impl ConnectionManager {
                                                                                                    println!("TCP Handler: Found Payload Body ({} bytes). Attempting unwrap...", body.len());
                                                                                                    // Recursively attempt to decode the body as a Sharing Frame
                                                                                                    match crate::proto::wire_format::Frame::decode(&body[..]) {
-                                                                                                       Ok(inner_sharing) => {
-                                                                                                           println!("TCP Handler: 📦 Unwrapped SharingFrame from PayloadTransfer!");
-                                                                                                           decoded_sharing_frame = Some(inner_sharing);
-                                                                                                       },
-                                                                                                       Err(e) => {
-                                                                                                           println!("TCP Handler: ⚠️ Failed to decode inner body as SharingFrame: {}", e);
-                                                                                                           println!("TCP Handler: 📥 Received File/Data Chunk ({} bytes)", body.len());
-                                                                                                           // Log raw body for debugging
-                                                                                                           println!("    -> Body Hex: {}", hex::encode(&body));
-                                                                                                       }
-                                                                                                   }
+                                                                                                        Ok(inner_sharing) => {
+                                                                                                            println!("TCP Handler: 📦 Unwrapped SharingFrame from PayloadTransfer!");
+                                                                                                            decoded_sharing_frame = Some(inner_sharing);
+                                                                                                        },
+                                                                                                        Err(_decode_err) => {
+                                                                                                            // This is actual file data, not a sharing frame!
+                                                                                                            // Buffer it by payload_id
+                                                                                                            if let Some(ref header) = pt.payload_header {
+                                                                                                                if let Some(payload_id) = header.id {
+                                                                                                                    // Only buffer if it's a FILE type (2)
+                                                                                                                    let is_file_type = header.r#type == Some(2);
+                                                                                                                    
+                                                                                                                    if is_file_type {
+                                                                                                                        // Add to buffer
+                                                                                                                        let buffer = file_buffers.entry(payload_id).or_insert_with(Vec::new);
+                                                                                                                        buffer.extend_from_slice(&body);
+                                                                                                                        println!("TCP Handler: 📥 Buffered {} bytes for payload_id: {} (Total: {} bytes)", 
+                                                                                                                            body.len(), payload_id, buffer.len());
+                                                                                                                        
+                                                                                                                        // Check if this is the last chunk (flags = 1)
+                                                                                                                        let is_last_chunk = chunk.flags == Some(1);
+                                                                                                                        
+                                                                                                                        if is_last_chunk {
+                                                                                                                            println!("TCP Handler: 🏁 LAST_CHUNK received for payload_id: {}", payload_id);
+                                                                                                                            
+                                                                                                                            // Look up filename from metadata
+                                                                                                                            let final_buffer = file_buffers.remove(&payload_id);
+                                                                                                                            
+                                                                                                                            if let Some(file_data) = final_buffer {
+                                                                                                                                let filename = file_metadata_map
+                                                                                                                                    .get(&payload_id)
+                                                                                                                                    .map(|(name, _)| name.clone())
+                                                                                                                                    .unwrap_or_else(|| format!("received_file_{}", payload_id));
+                                                                                                                                
+                                                                                                                                // Save to Downloads folder
+                                                                                                                                let download_path = std::env::var("HOME")
+                                                                                                                                    .map(|h| format!("{}/Downloads/{}", h, filename))
+                                                                                                                                    .unwrap_or_else(|_| format!("/tmp/{}", filename));
+                                                                                                                                
+                                                                                                                                match std::fs::write(&download_path, &file_data) {
+                                                                                                                                    Ok(()) => {
+                                                                                                                                        println!("TCP Handler: ✅ FILE SAVED! {} ({} bytes) -> {}", 
+                                                                                                                                            filename, file_data.len(), download_path);
+                                                                                                                                    },
+                                                                                                                                    Err(e) => {
+                                                                                                                                        println!("TCP Handler: ❌ Failed to save file: {}", e);
+                                                                                                                                    }
+                                                                                                                                }
+                                                                                                                            }
+                                                                                                                        }
+                                                                                                                    } else {
+                                                                                                                        println!("TCP Handler: 📥 Non-file PayloadTransfer chunk ({} bytes)", body.len());
+                                                                                                                    }
+                                                                                                                }
+                                                                                                            }
+                                                                                                        }
+                                                                                                    }
                                                                                                } else {
-                                                                                                   println!("TCP Handler: PayloadChunk body is None");
+                                                                                                   // Body is None - but check if this is a LAST_CHUNK end marker!
+                                                                                                   let is_last_chunk = chunk.flags == Some(1);
+                                                                                                   if is_last_chunk {
+                                                                                                       println!("TCP Handler: 🏁 LAST_CHUNK END MARKER received (no body)");
+                                                                                                       if let Some(ref header) = pt.payload_header {
+                                                                                                           if let Some(payload_id) = header.id {
+                                                                                                               let final_buffer = file_buffers.remove(&payload_id);
+                                                                                                               
+                                                                                                               if let Some(file_data) = final_buffer {
+                                                                                                                   let filename = file_metadata_map
+                                                                                                                       .get(&payload_id)
+                                                                                                                       .map(|(name, _)| name.clone())
+                                                                                                                       .unwrap_or_else(|| format!("received_file_{}", payload_id));
+                                                                                                                   
+                                                                                                                   // Save to Downloads folder
+                                                                                                                   let download_path = std::env::var("HOME")
+                                                                                                                       .map(|h| format!("{}/Downloads/{}", h, filename))
+                                                                                                                       .unwrap_or_else(|_| format!("/tmp/{}", filename));
+                                                                                                                   
+                                                                                                                   match std::fs::write(&download_path, &file_data) {
+                                                                                                                       Ok(()) => {
+                                                                                                                           println!("TCP Handler: ✅ FILE SAVED! {} ({} bytes) -> {}", 
+                                                                                                                               filename, file_data.len(), download_path);
+                                                                                                                       },
+                                                                                                                       Err(e) => {
+                                                                                                                           println!("TCP Handler: ❌ Failed to save file: {}", e);
+                                                                                                                       }
+                                                                                                                   }
+                                                                                                               } else {
+                                                                                                                   println!("TCP Handler: ⚠️ No buffered data for payload_id: {}", payload_id);
+                                                                                                               }
+                                                                                                           }
+                                                                                                       }
+                                                                                                   } else {
+                                                                                                       println!("TCP Handler: PayloadChunk body is None");
+                                                                                                   }
                                                                                                }
                                                                                            } else {
                                                                                                println!("TCP Handler: PayloadChunk is None");
@@ -616,8 +706,14 @@ impl ConnectionManager {
                                                                                        6 => "CONTACT_CARD",
                                                                                        _ => "UNKNOWN",
                                                                                    };
-                                                                                   println!("    📁 File {}: {} ({}) - {} bytes [{}]", i + 1, name, type_str, size, mime);
-                                                                               }
+                                                                                    println!("    📁 File {}: {} ({}) - {} bytes [{}]", i + 1, name, type_str, size, mime);
+                                                                                    
+                                                                                    // Store metadata for payload reassembly
+                                                                                    if let Some(payload_id) = file.payload_id {
+                                                                                        file_metadata_map.insert(payload_id, (name.to_string(), size));
+                                                                                        println!("    📦 Registered payload_id: {} for file: {}", payload_id, name);
+                                                                                    }
+                                                                                }
                                                                                
                                                                                // Auto-accept for now (TODO: CLI prompt)
                                                                                println!("TCP Handler: ✅ Auto-accepting transfer...");
@@ -769,6 +865,23 @@ impl ConnectionManager {
                                                                              socket.write_all(&len_prefix).await?;
                                                                              socket.write_all(&encrypted_ka).await?;
                                                                              println!("TCP Handler: Sent KEEP_ALIVE Ack.");
+                                                                      } else if frame_type == 2 { // RESPONSE (ConnectionResponseFrame)
+                                                                           println!("TCP Handler: 📬 Client's RESPONSE received!");
+                                                                           if let Some(conn_resp) = &v1.connection_response {
+                                                                               let status = conn_resp.status.unwrap_or(0);
+                                                                               let status_str = match status {
+                                                                                   1 => "ACCEPT",
+                                                                                   2 => "REJECT",
+                                                                                   3 => "NOT_ENOUGH_SPACE",
+                                                                                   4 => "UNSUPPORTED_ATTACHMENT_TYPE",
+                                                                                   5 => "TIMED_OUT",
+                                                                                   _ => "UNKNOWN",
+                                                                               };
+                                                                               println!("    -> Status: {} ({})", status, status_str);
+                                                                               if status == 1 {
+                                                                                   println!("TCP Handler: ✅ Phone confirmed ACCEPT - file transfer should begin!");
+                                                                               }
+                                                                           }
                                                                       } else if frame_type == 6 { // CANCEL
                                                                            println!("TCP Handler: ❌ Received CANCEL from client.");
                                                                       } else {
