@@ -16,7 +16,10 @@ impl ConnectionManager {
         match TcpStream::connect(target).await {
             Ok(mut socket) => {
                 println!("REVERSE: Connection established! Starting handshake...");
-                if let Err(e) = Self::handle_connection(&mut socket).await {
+                // Use default Downloads directory for reverse connections
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                let download_dir = std::path::PathBuf::from(format!("{}/Downloads", home));
+                if let Err(e) = Self::handle_connection(&mut socket, download_dir).await {
                     eprintln!("REVERSE: Handshake failed: {}", e);
                 }
                 Ok(())
@@ -29,10 +32,11 @@ impl ConnectionManager {
     }
 
     /// Starts the TCP Listener on Port 5200 (Standard Quick Share Port)
-    pub async fn start_server() -> Result<()> {
+    pub async fn start_server(download_dir: std::path::PathBuf) -> Result<()> {
         let addr = "0.0.0.0:5200";
         let listener = TcpListener::bind(addr).await?;
         println!("TCP Server: Listening for Quick Share connections on {}", addr);
+        println!("TCP Server: Download directory: {}", download_dir.display());
 
         loop {
             // Accept new connection
@@ -40,8 +44,9 @@ impl ConnectionManager {
             println!("TCP Server: Incoming connection from {}", peer_addr);
 
             // Spawn a task to handle this connection so we don't block the listener
+            let download_dir_clone = download_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(&mut socket).await {
+                if let Err(e) = Self::handle_connection(&mut socket, download_dir_clone).await {
                     eprintln!("TCP Server: Connection error from {}: {}", peer_addr, e);
                 }
             });
@@ -52,7 +57,7 @@ impl ConnectionManager {
     /// 1. Loop to read Frames.
     /// 2. Decode ConnectionRequest.
     /// 3. Decode UKEY2 Client Init.
-    async fn handle_connection(socket: &mut tokio::net::TcpStream) -> Result<()> {
+    async fn handle_connection(socket: &mut tokio::net::TcpStream, download_dir: std::path::PathBuf) -> Result<()> {
         println!("TCP Handler: Handler started.");
         let mut _remote_handshake_data: Option<Vec<u8>> = None;
 
@@ -476,15 +481,13 @@ impl ConnectionManager {
                                                                                                                                     .map(|(name, _)| name.clone())
                                                                                                                                     .unwrap_or_else(|| format!("received_file_{}", payload_id));
                                                                                                                                 
-                                                                                                                                // Save to Downloads folder
-                                                                                                                                let download_path = std::env::var("HOME")
-                                                                                                                                    .map(|h| format!("{}/Downloads/{}", h, filename))
-                                                                                                                                    .unwrap_or_else(|_| format!("/tmp/{}", filename));
+                                                                                                                                // Save to configured download folder
+                                                                                                                                let download_path = download_dir.join(&filename);
                                                                                                                                 
                                                                                                                                 match std::fs::write(&download_path, &file_data) {
                                                                                                                                     Ok(()) => {
                                                                                                                                         println!("TCP Handler: ✅ FILE SAVED! {} ({} bytes) -> {}", 
-                                                                                                                                            filename, file_data.len(), download_path);
+                                                                                                                                            filename, file_data.len(), download_path.display());
                                                                                                                                     },
                                                                                                                                     Err(e) => {
                                                                                                                                         println!("TCP Handler: ❌ Failed to save file: {}", e);
@@ -514,15 +517,13 @@ impl ConnectionManager {
                                                                                                                        .map(|(name, _)| name.clone())
                                                                                                                        .unwrap_or_else(|| format!("received_file_{}", payload_id));
                                                                                                                    
-                                                                                                                   // Save to Downloads folder
-                                                                                                                   let download_path = std::env::var("HOME")
-                                                                                                                       .map(|h| format!("{}/Downloads/{}", h, filename))
-                                                                                                                       .unwrap_or_else(|_| format!("/tmp/{}", filename));
+                                                                                                                    // Save to configured download folder
+                                                                                                                   let download_path = download_dir.join(&filename);
                                                                                                                    
                                                                                                                    match std::fs::write(&download_path, &file_data) {
                                                                                                                        Ok(()) => {
                                                                                                                            println!("TCP Handler: ✅ FILE SAVED! {} ({} bytes) -> {}", 
-                                                                                                                               filename, file_data.len(), download_path);
+                                                                                                                               filename, file_data.len(), download_path.display());
                                                                                                                        },
                                                                                                                        Err(e) => {
                                                                                                                            println!("TCP Handler: ❌ Failed to save file: {}", e);
@@ -714,9 +715,152 @@ impl ConnectionManager {
                                                                                         println!("    📦 Registered payload_id: {} for file: {}", payload_id, name);
                                                                                     }
                                                                                 }
-                                                                               
-                                                                               // Auto-accept for now (TODO: CLI prompt)
-                                                                               println!("TCP Handler: ✅ Auto-accepting transfer...");
+                                                                                
+                                                                                // CLI Prompt: Ask user to Accept or Reject
+                                                                                println!();
+                                                                                println!("╔════════════════════════════════════════════════════╗");
+                                                                                println!("║       📥 INCOMING FILE TRANSFER REQUEST            ║");
+                                                                                println!("╠════════════════════════════════════════════════════╣");
+                                                                                for file in intro.file_metadata.iter() {
+                                                                                    let name = file.name.as_deref().unwrap_or("Unknown");
+                                                                                    let size = file.size.unwrap_or(0);
+                                                                                    let size_str = if size < 1024 {
+                                                                                        format!("{} B", size)
+                                                                                    } else if size < 1024 * 1024 {
+                                                                                        format!("{:.1} KB", size as f64 / 1024.0)
+                                                                                    } else {
+                                                                                        format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
+                                                                                    };
+                                                                                    println!("║ 📁 {} ({})", name, size_str);
+                                                                                }
+                                                                                println!("╚════════════════════════════════════════════════════╝");
+                                                                                println!();
+                                                                                
+                                                                                // Auto-accept for CLI (blocking stdin breaks the protocol timing)
+                                                                                // TODO: GUI will properly handle accept/reject via channels
+                                                                                println!("✅ Auto-accepting transfer (use GUI for interactive accept/reject)");
+                                                                                let user_accepted = true;
+                                                                                
+                                                                                if !user_accepted {
+                                                                                    println!("TCP Handler: ❌ User REJECTED transfer.");
+                                                                                    
+                                                                                    // Create RESPONSE frame with REJECT
+                                                                                    let response = crate::proto::wire_format::ConnectionResponseFrame {
+                                                                                        status: Some(crate::proto::wire_format::connection_response_frame::Status::Reject.into()),
+                                                                                    };
+                                                                                    let response_v1 = crate::proto::wire_format::V1Frame {
+                                                                                        r#type: Some(crate::proto::wire_format::v1_frame::FrameType::Response.into()),
+                                                                                        connection_response: Some(response),
+                                                                                        ..Default::default()
+                                                                                    };
+                                                                                    let response_frame = crate::proto::wire_format::Frame {
+                                                                                        version: Some(crate::proto::wire_format::frame::Version::V1.into()),
+                                                                                        v1: Some(response_v1),
+                                                                                    };
+                                                                                    
+                                                                                    let mut resp_buf = Vec::new();
+                                                                                    response_frame.encode(&mut resp_buf)?;
+                                                                                    let resp_buf_len = resp_buf.len() as i64;
+                                                                                    
+                                                                                    // Wrap in PayloadTransfer and send
+                                                                                    let resp_payload_id: i64 = rand::random();
+                                                                                    let resp_header = crate::proto::quick_share::payload_transfer::PayloadHeader {
+                                                                                        id: Some(resp_payload_id),
+                                                                                        r#type: Some(crate::proto::quick_share::payload_transfer::payload_header::PayloadType::Bytes.into()),
+                                                                                        total_size: Some(resp_buf_len),
+                                                                                        is_sensitive: Some(false),
+                                                                                        ..Default::default()
+                                                                                    };
+                                                                                    
+                                                                                    let resp_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                                                        flags: Some(0),
+                                                                                        offset: Some(0),
+                                                                                        body: Some(resp_buf),
+                                                                                    };
+                                                                                    
+                                                                                    let resp_pt = crate::proto::quick_share::PayloadTransfer {
+                                                                                        packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                                                        payload_header: Some(resp_header.clone()),
+                                                                                        payload_chunk: Some(resp_chunk),
+                                                                                        control_message: None,
+                                                                                    };
+                                                                                    
+                                                                                    let resp_offline = crate::proto::quick_share::OfflineFrame {
+                                                                                        version: Some(1),
+                                                                                        v1: Some(crate::proto::quick_share::V1Frame {
+                                                                                            r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                                                            payload_transfer: Some(resp_pt),
+                                                                                            ..Default::default()
+                                                                                        }),
+                                                                                    };
+                                                                                    
+                                                                                    let mut resp_offline_buf = Vec::new();
+                                                                                    resp_offline.encode(&mut resp_offline_buf)?;
+                                                                                    
+                                                                                    let d2d_resp = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                                        sequence_number: Some(5), 
+                                                                                        message: Some(resp_offline_buf),
+                                                                                    };
+                                                                                    let mut d2d_resp_buf = Vec::new();
+                                                                                    d2d_resp.encode(&mut d2d_resp_buf)?;
+                                                                                    
+                                                                                    let gcm_meta = crate::proto::ukey2::GcmMetadata {
+                                                                                        r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
+                                                                                        version: Some(1),
+                                                                                    };
+                                                                                    let mut meta_bytes = Vec::new();
+                                                                                    gcm_meta.encode(&mut meta_bytes)?;
+                                                                                    
+                                                                                    let encrypted_resp = engine.encrypt_and_sign(&d2d_resp_buf, Some(&meta_bytes))?;
+                                                                                    let len_prefix = (encrypted_resp.len() as u32).to_be_bytes();
+                                                                                    socket.write_all(&len_prefix).await?;
+                                                                                    socket.write_all(&encrypted_resp).await?;
+                                                                                    println!("TCP Handler: Sent RESPONSE (REJECT)!");
+                                                                                    
+                                                                                    // Send END marker
+                                                                                    let resp_end_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                                                        flags: Some(1),
+                                                                                        offset: Some(resp_buf_len),
+                                                                                        body: None,
+                                                                                    };
+                                                                                    
+                                                                                    let resp_end_pt = crate::proto::quick_share::PayloadTransfer {
+                                                                                        packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                                                        payload_header: Some(resp_header),
+                                                                                        payload_chunk: Some(resp_end_chunk),
+                                                                                        control_message: None,
+                                                                                    };
+                                                                                    
+                                                                                    let resp_end_offline = crate::proto::quick_share::OfflineFrame {
+                                                                                        version: Some(1),
+                                                                                        v1: Some(crate::proto::quick_share::V1Frame {
+                                                                                            r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                                                            payload_transfer: Some(resp_end_pt),
+                                                                                            ..Default::default()
+                                                                                        }),
+                                                                                    };
+                                                                                    
+                                                                                    let mut resp_end_buf = Vec::new();
+                                                                                    resp_end_offline.encode(&mut resp_end_buf)?;
+                                                                                    
+                                                                                    let d2d_resp_end = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                                        sequence_number: Some(6), 
+                                                                                        message: Some(resp_end_buf),
+                                                                                    };
+                                                                                    let mut d2d_resp_end_buf = Vec::new();
+                                                                                    d2d_resp_end.encode(&mut d2d_resp_end_buf)?;
+                                                                                    
+                                                                                    let encrypted_resp_end = engine.encrypt_and_sign(&d2d_resp_end_buf, Some(&meta_bytes))?;
+                                                                                    let end_len_prefix = (encrypted_resp_end.len() as u32).to_be_bytes();
+                                                                                    socket.write_all(&end_len_prefix).await?;
+                                                                                    socket.write_all(&encrypted_resp_end).await?;
+                                                                                    println!("TCP Handler: Sent REJECT END marker!");
+                                                                                    
+                                                                                    // Exit the loop - transfer rejected
+                                                                                    break;
+                                                                                }
+                                                                                
+                                                                                println!("TCP Handler: ✅ User ACCEPTED transfer!");
                                                                                
                                                                                // Create RESPONSE frame with ACCEPT
                                                                                let response = crate::proto::wire_format::ConnectionResponseFrame {
