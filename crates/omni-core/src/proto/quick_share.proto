@@ -1,0 +1,166 @@
+syntax = "proto2";
+
+package location.nearby.connections;
+
+option java_outer_classname = "OfflineWireFormats";
+option optimize_for = LITE_RUNTIME;
+
+// The root container for all Quick Share messages.
+message OfflineFrame {
+  optional int32 version = 1 [default = 1];
+  
+  optional V1Frame v1 = 2;
+}
+
+message V1Frame {
+  enum FrameType {
+    UNKNOWN_FRAME_TYPE = 0;
+    CONNECTION_REQUEST = 1;
+    CONNECTION_RESPONSE = 2;
+    PAYLOAD_TRANSFER = 3;
+    BANDWIDTH_UPGRADE_NEGOTIATION = 4;
+    KEEP_ALIVE = 5;
+    DISCONNECTION = 6;
+    PAIRED_KEY_ENCRYPTION = 7;
+    AUTHENTICATION_MESSAGE = 8;
+    AUTHENTICATION_RESULT = 9;
+    AUTO_RESUME = 10;
+    AUTO_RECONNECT = 11;
+    BANDWIDTH_UPGRADE_RETRY = 12;
+  }
+
+  optional FrameType type = 1;
+
+  optional ConnectionRequest connection_request = 2;
+  optional ConnectionResponse connection_response = 3;
+  optional PayloadTransfer payload_transfer = 4;
+  optional BandwidthUpgradeNegotiation bandwidth_upgrade_negotiation = 5;
+  optional KeepAlive keep_alive = 6;
+  optional Disconnection disconnection = 7;
+  optional PairedKeyEncryption paired_key_encryption = 8;
+  optional AuthenticationMessage authentication_message = 9;
+  optional AuthenticationResult authentication_result = 10;
+}
+
+message ConnectionRequest {
+  optional string endpoint_id = 1;
+  optional string endpoint_name = 2;
+  optional string endpoint_info = 3;
+  optional int32 nonce = 4;
+  repeated int32 mediums = 5;
+  optional bytes handshake_data = 6;
+}
+
+message ConnectionResponse {
+  // Using ConnectionResponseFrame structure from offline_wire_formats.proto reference
+  
+  optional int32 status = 1 [deprecated = true]; 
+  optional bytes handshake_data = 2;
+
+  enum ResponseStatus {
+    UNKNOWN_RESPONSE_STATUS = 0;
+    ACCEPT = 1;
+    REJECT = 2;
+  }
+  optional ResponseStatus response = 3;
+  optional OsInfo os_info = 4;
+  optional int32 multiplex_socket_bitmask = 5;
+  optional int32 nearby_connections_version = 6 [deprecated = true];
+  optional int32 safe_to_disconnect_version = 7;
+}
+
+message OsInfo {
+  enum OsType {
+    UNKNOWN_OS_TYPE = 0;
+    ANDROID = 1;
+    CHROME_OS = 2;
+    WINDOWS = 3;
+    APPLE = 4;
+    LINUX = 100;
+  }
+
+  optional OsType type = 1;
+}
+
+message PayloadTransfer {
+  enum PacketType {
+    UNKNOWN_PACKET_TYPE = 0;
+    DATA = 1;
+    CONTROL = 2;
+  }
+
+  message PayloadHeader {
+    enum PayloadType {
+      UNKNOWN_PAYLOAD_TYPE = 0;
+      BYTES = 1;
+      FILE = 2;
+      STREAM = 3;
+    }
+    optional int64 id = 1;
+    optional PayloadType type = 2;
+    optional int64 total_size = 3;
+    optional bool is_sensitive = 4;
+    optional string file_name = 5;
+  }
+
+  message PayloadChunk {
+    enum Flags {
+      LAST_CHUNK = 0x1;
+    }
+    optional int32 flags = 1;
+    optional int64 offset = 2;
+    optional bytes body = 3;
+  }
+
+  message ControlMessage {
+    enum EventType {
+      UNKNOWN_EVENT_TYPE = 0;
+      PAYLOAD_ERROR = 1;
+      PAYLOAD_CANCELED = 2;
+    }
+    optional EventType event = 1;
+    optional int64 offset = 2;
+  }
+
+  optional PacketType packet_type = 1;
+  optional PayloadHeader payload_header = 2;
+  optional PayloadChunk payload_chunk = 3;
+  optional ControlMessage control_message = 4;
+}
+
+message BandwidthUpgradeNegotiation {
+   enum EventType {
+     UNKNOWN = 0;
+     UPGRADE_PATH_AVAILABLE = 1;
+     UPGRADE_FAILURE = 2;
+   }
+   optional EventType event_type = 1; 
+}
+
+message KeepAlive {
+  optional bool ack = 1;
+}
+
+message Disconnection {
+  optional bool request_safe_to_disconnect = 1; 
+}
+
+message PairedKeyEncryption {
+  optional bytes signed_data = 1;
+  optional bytes secret_id_hash = 2;
+}
+
+message AuthenticationMessage {
+  optional bytes auth_token = 1;
+  optional int32 auth_type = 2;
+}
+
+message AuthenticationResult {
+  enum Status {
+    UNKNOWN = 0;
+    SUCCESS = 1;
+    FAILURE = 2;
+  }
+  optional Status status = 1;
+  optional bytes auth_token = 2;
+}

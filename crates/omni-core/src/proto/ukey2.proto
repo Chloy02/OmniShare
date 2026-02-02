@@ -1,0 +1,72 @@
+syntax = "proto2";
+
+package securegcm;
+
+option java_outer_classname = "Ukey2";
+
+enum Ukey2HandshakeCipher {
+  RESERVED = 0;
+  P256_SHA512 = 100;
+  CURVE25519_SHA512 = 200;
+}
+
+message Ukey2Message {
+  enum Type {
+    UNKNOWN_DO_NOT_USE = 0;
+    ALERT = 1;
+    CLIENT_INIT = 2;
+    SERVER_INIT = 3;
+    CLIENT_FINISHED = 4;
+  }
+
+  optional Type message_type = 1;
+  optional bytes message_data = 2;
+}
+
+message EcP256PublicKey {
+  optional bytes x = 1;
+  optional bytes y = 2;
+}
+
+message GenericPublicKey {
+  enum Type {
+    UNKNOWN = 0;
+    EC_P256 = 1;
+  }
+  optional int32 type = 1; // 1 for EC_P256
+  optional EcP256PublicKey ec_p256_public_key = 2; 
+}
+
+message Ukey2ClientInit {
+  optional int32 version = 1;
+  optional bytes random = 2;
+  // Field 3: List of Cipher Commitments (Message)
+  repeated CipherCommitment cipher_commitments = 3;
+  // Field 4: Next Protocol String (Bytes)
+  optional bytes next_protocol = 4;
+}
+
+message CipherCommitment {
+  optional int32 handshake_cipher = 1;
+  optional bytes random = 2;
+}
+
+message Ukey2ServerInit {
+  optional int32 version = 1;
+  optional bytes random = 2;
+  optional Ukey2HandshakeCipher handshake_cipher = 3;
+  optional GenericPublicKey public_key = 4;
+}
+
+message Ukey2ClientFinished {
+  optional GenericPublicKey public_key = 1;
+}
+
+message Ukey2Alert {
+  enum Type {
+    BAD_MESSAGE = 1;
+    BAD_MAC = 2;
+  }
+  optional Type type = 1;
+  optional string error_message = 2;
+}
