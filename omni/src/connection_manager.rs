@@ -254,15 +254,52 @@ impl ConnectionManager {
                                                       v1: Some(pke_frame_v1),
                                                   };
                                                   
-                                                  // Serialize the Sharing Frame (Directly, NO PayloadTransfer wrapping for PKE)
-                                                  // Reference: NearDrop's sendTransferSetupFrame just sends the Frame
+                                                  // Serialize the Sharing Frame
                                                   let mut pke_buf = Vec::new();
                                                   pke_sharing_frame.encode(&mut pke_buf)?;
+                                                  let pke_buf_len = pke_buf.len() as i64;
+                                                  
+                                                  // Generate a random payload ID for this transfer
+                                                  let payload_id: i64 = rand::random();
+                                                  
+                                                  // Wrap in PayloadTransfer (OfflineFrame Type 3) per PROTOCOL.md line 202
+                                                  let payload_header = crate::proto::quick_share::payload_transfer::PayloadHeader {
+                                                      id: Some(payload_id),
+                                                      r#type: Some(crate::proto::quick_share::payload_transfer::payload_header::PayloadType::Bytes.into()),
+                                                      total_size: Some(pke_buf_len),
+                                                      is_sensitive: Some(false),
+                                                      ..Default::default()
+                                                  };
+                                                  
+                                                  let payload_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                      flags: Some(0), // Not the last chunk yet
+                                                      offset: Some(0),
+                                                      body: Some(pke_buf),
+                                                  };
+                                                  
+                                                  let payload_transfer = crate::proto::quick_share::PayloadTransfer {
+                                                      packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                      payload_header: Some(payload_header.clone()),
+                                                      payload_chunk: Some(payload_chunk),
+                                                      control_message: None,
+                                                  };
+                                                  
+                                                  let offline_frame = crate::proto::quick_share::OfflineFrame {
+                                                      version: Some(1),
+                                                      v1: Some(crate::proto::quick_share::V1Frame {
+                                                          r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                          payload_transfer: Some(payload_transfer),
+                                                          ..Default::default()
+                                                      }),
+                                                  };
+                                                  
+                                                  let mut offline_buf = Vec::new();
+                                                  offline_frame.encode(&mut offline_buf)?;
                                                   
                                                   // Wrap in DeviceToDeviceMessage
                                                   let d2d_msg = crate::proto::ukey2::DeviceToDeviceMessage {
                                                       sequence_number: Some(1), 
-                                                      message: Some(pke_buf),
+                                                      message: Some(offline_buf),
                                                   };
                                                   let mut d2d_buf = Vec::new();
                                                   d2d_msg.encode(&mut d2d_buf)?;
@@ -275,14 +312,53 @@ impl ConnectionManager {
                                                   let mut meta_bytes = Vec::new();
                                                   gcm_meta.encode(&mut meta_bytes)?;
                                                   
-                                                  // Encrypt this payload
+                                                  // Encrypt and send the DATA frame
                                                   let encrypted_pke = engine.encrypt_and_sign(&d2d_buf, Some(&meta_bytes))?;
-                                                  println!("TCP Handler: Encrypted PKE Frame size: {}", encrypted_pke.len());
+                                                  println!("TCP Handler: Encrypted PKE PayloadTransfer Frame size: {}", encrypted_pke.len());
                                                   
                                                   let pke_len_prefix = (encrypted_pke.len() as u32).to_be_bytes();
                                                   socket.write_all(&pke_len_prefix).await?;
                                                   socket.write_all(&encrypted_pke).await?;
-                                                  println!("TCP Handler: Sent Encrypted PairedKeyEncryption (sharing.nearby.Frame)!");
+                                                  println!("TCP Handler: Sent PKE in PayloadTransfer (data frame)!");
+                                                  
+                                                  // Send the END marker (second frame with LAST_CHUNK flag, no body)
+                                                  let end_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                      flags: Some(1), // LAST_CHUNK
+                                                      offset: Some(pke_buf_len),
+                                                      body: None,
+                                                  };
+                                                  
+                                                  let end_payload_transfer = crate::proto::quick_share::PayloadTransfer {
+                                                      packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                      payload_header: Some(payload_header),
+                                                      payload_chunk: Some(end_chunk),
+                                                      control_message: None,
+                                                  };
+                                                  
+                                                  let end_offline_frame = crate::proto::quick_share::OfflineFrame {
+                                                      version: Some(1),
+                                                      v1: Some(crate::proto::quick_share::V1Frame {
+                                                          r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                          payload_transfer: Some(end_payload_transfer),
+                                                          ..Default::default()
+                                                      }),
+                                                  };
+                                                  
+                                                  let mut end_buf = Vec::new();
+                                                  end_offline_frame.encode(&mut end_buf)?;
+                                                  
+                                                  let d2d_end = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                      sequence_number: Some(2), 
+                                                      message: Some(end_buf),
+                                                  };
+                                                  let mut d2d_end_buf = Vec::new();
+                                                  d2d_end.encode(&mut d2d_end_buf)?;
+                                                  
+                                                  let encrypted_end = engine.encrypt_and_sign(&d2d_end_buf, Some(&meta_bytes))?;
+                                                  let end_len_prefix = (encrypted_end.len() as u32).to_be_bytes();
+                                                  socket.write_all(&end_len_prefix).await?;
+                                                  socket.write_all(&encrypted_end).await?;
+                                                  println!("TCP Handler: Sent PKE END marker!");
 
                                                   // Now we listen for the Client's encrypted reply
                                                   println!("TCP Handler: Listening for Client's Encrypted Frames...");
@@ -418,10 +494,48 @@ impl ConnectionManager {
                                                                            
                                                                            let mut pkr_buf = Vec::new();
                                                                            pkr_sharing_frame.encode(&mut pkr_buf)?;
+                                                                           let pkr_buf_len = pkr_buf.len() as i64;
+                                                                           
+                                                                           // Generate a random payload ID for this transfer
+                                                                           let pkr_payload_id: i64 = rand::random();
+                                                                           
+                                                                           // Wrap in PayloadTransfer (OfflineFrame Type 3)
+                                                                           let pkr_header = crate::proto::quick_share::payload_transfer::PayloadHeader {
+                                                                               id: Some(pkr_payload_id),
+                                                                               r#type: Some(crate::proto::quick_share::payload_transfer::payload_header::PayloadType::Bytes.into()),
+                                                                               total_size: Some(pkr_buf_len),
+                                                                               is_sensitive: Some(false),
+                                                                               ..Default::default()
+                                                                           };
+                                                                           
+                                                                           let pkr_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                                               flags: Some(0),
+                                                                               offset: Some(0),
+                                                                               body: Some(pkr_buf),
+                                                                           };
+                                                                           
+                                                                           let pkr_pt = crate::proto::quick_share::PayloadTransfer {
+                                                                               packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                                               payload_header: Some(pkr_header.clone()),
+                                                                               payload_chunk: Some(pkr_chunk),
+                                                                               control_message: None,
+                                                                           };
+                                                                           
+                                                                           let pkr_offline = crate::proto::quick_share::OfflineFrame {
+                                                                               version: Some(1),
+                                                                               v1: Some(crate::proto::quick_share::V1Frame {
+                                                                                   r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                                                   payload_transfer: Some(pkr_pt),
+                                                                                   ..Default::default()
+                                                                               }),
+                                                                           };
+                                                                           
+                                                                           let mut pkr_offline_buf = Vec::new();
+                                                                           pkr_offline.encode(&mut pkr_offline_buf)?;
                                                                            
                                                                            let d2d_pkr = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                               sequence_number: Some(2), 
-                                                                               message: Some(pkr_buf),
+                                                                               sequence_number: Some(3), 
+                                                                               message: Some(pkr_offline_buf),
                                                                            };
                                                                            let mut d2d_pkr_buf = Vec::new();
                                                                            d2d_pkr.encode(&mut d2d_pkr_buf)?;
@@ -437,7 +551,46 @@ impl ConnectionManager {
                                                                            let len_prefix = (encrypted_pkr.len() as u32).to_be_bytes();
                                                                            socket.write_all(&len_prefix).await?;
                                                                            socket.write_all(&encrypted_pkr).await?;
-                                                                           println!("TCP Handler: Sent Encrypted PairedKeyResult (UNABLE)!");
+                                                                           println!("TCP Handler: Sent PKR in PayloadTransfer (data frame)!");
+                                                                           
+                                                                           // Send END marker
+                                                                           let pkr_end_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                                               flags: Some(1), // LAST_CHUNK
+                                                                               offset: Some(pkr_buf_len),
+                                                                               body: None,
+                                                                           };
+                                                                           
+                                                                           let pkr_end_pt = crate::proto::quick_share::PayloadTransfer {
+                                                                               packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                                               payload_header: Some(pkr_header),
+                                                                               payload_chunk: Some(pkr_end_chunk),
+                                                                               control_message: None,
+                                                                           };
+                                                                           
+                                                                           let pkr_end_offline = crate::proto::quick_share::OfflineFrame {
+                                                                               version: Some(1),
+                                                                               v1: Some(crate::proto::quick_share::V1Frame {
+                                                                                   r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                                                   payload_transfer: Some(pkr_end_pt),
+                                                                                   ..Default::default()
+                                                                               }),
+                                                                           };
+                                                                           
+                                                                           let mut pkr_end_buf = Vec::new();
+                                                                           pkr_end_offline.encode(&mut pkr_end_buf)?;
+                                                                           
+                                                                           let d2d_pkr_end = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                               sequence_number: Some(4), 
+                                                                               message: Some(pkr_end_buf),
+                                                                           };
+                                                                           let mut d2d_pkr_end_buf = Vec::new();
+                                                                           d2d_pkr_end.encode(&mut d2d_pkr_end_buf)?;
+                                                                           
+                                                                           let encrypted_pkr_end = engine.encrypt_and_sign(&d2d_pkr_end_buf, Some(&meta_bytes))?;
+                                                                           let end_len_prefix = (encrypted_pkr_end.len() as u32).to_be_bytes();
+                                                                           socket.write_all(&end_len_prefix).await?;
+                                                                           socket.write_all(&encrypted_pkr_end).await?;
+                                                                           println!("TCP Handler: Sent PKR END marker!");
 
                                                                       } else if frame_type == 4 { // PAIRED_KEY_RESULT
                                                                            println!("TCP Handler: 🔑 Client's PAIRED_KEY_RESULT received!");
@@ -447,6 +600,139 @@ impl ConnectionManager {
                                                                       } else if frame_type == 1 { // INTRODUCTION
                                                                            if let Some(intro) = v1.introduction {
                                                                                println!("TCP Handler: 📜 INTRODUCTION received! File count: {}", intro.file_metadata.len());
+                                                                               
+                                                                               // Display file metadata
+                                                                               for (i, file) in intro.file_metadata.iter().enumerate() {
+                                                                                   let name = file.name.as_deref().unwrap_or("Unknown");
+                                                                                   let size = file.size.unwrap_or(0);
+                                                                                   let mime = file.mime_type.as_deref().unwrap_or("application/octet-stream");
+                                                                                   let file_type = file.r#type.unwrap_or(0);
+                                                                                   let type_str = match file_type {
+                                                                                       1 => "IMAGE",
+                                                                                       2 => "VIDEO",
+                                                                                       3 => "ANDROID_APP",
+                                                                                       4 => "AUDIO",
+                                                                                       5 => "DOCUMENT",
+                                                                                       6 => "CONTACT_CARD",
+                                                                                       _ => "UNKNOWN",
+                                                                                   };
+                                                                                   println!("    📁 File {}: {} ({}) - {} bytes [{}]", i + 1, name, type_str, size, mime);
+                                                                               }
+                                                                               
+                                                                               // Auto-accept for now (TODO: CLI prompt)
+                                                                               println!("TCP Handler: ✅ Auto-accepting transfer...");
+                                                                               
+                                                                               // Create RESPONSE frame with ACCEPT
+                                                                               let response = crate::proto::wire_format::ConnectionResponseFrame {
+                                                                                   status: Some(crate::proto::wire_format::connection_response_frame::Status::Accept.into()),
+                                                                               };
+                                                                               let response_v1 = crate::proto::wire_format::V1Frame {
+                                                                                   r#type: Some(crate::proto::wire_format::v1_frame::FrameType::Response.into()),
+                                                                                   connection_response: Some(response),
+                                                                                   ..Default::default()
+                                                                               };
+                                                                               let response_frame = crate::proto::wire_format::Frame {
+                                                                                   version: Some(crate::proto::wire_format::frame::Version::V1.into()),
+                                                                                   v1: Some(response_v1),
+                                                                               };
+                                                                               
+                                                                               let mut resp_buf = Vec::new();
+                                                                               response_frame.encode(&mut resp_buf)?;
+                                                                               let resp_buf_len = resp_buf.len() as i64;
+                                                                               
+                                                                               // Wrap in PayloadTransfer
+                                                                               let resp_payload_id: i64 = rand::random();
+                                                                               let resp_header = crate::proto::quick_share::payload_transfer::PayloadHeader {
+                                                                                   id: Some(resp_payload_id),
+                                                                                   r#type: Some(crate::proto::quick_share::payload_transfer::payload_header::PayloadType::Bytes.into()),
+                                                                                   total_size: Some(resp_buf_len),
+                                                                                   is_sensitive: Some(false),
+                                                                                   ..Default::default()
+                                                                               };
+                                                                               
+                                                                               let resp_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                                                   flags: Some(0),
+                                                                                   offset: Some(0),
+                                                                                   body: Some(resp_buf),
+                                                                               };
+                                                                               
+                                                                               let resp_pt = crate::proto::quick_share::PayloadTransfer {
+                                                                                   packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                                                   payload_header: Some(resp_header.clone()),
+                                                                                   payload_chunk: Some(resp_chunk),
+                                                                                   control_message: None,
+                                                                               };
+                                                                               
+                                                                               let resp_offline = crate::proto::quick_share::OfflineFrame {
+                                                                                   version: Some(1),
+                                                                                   v1: Some(crate::proto::quick_share::V1Frame {
+                                                                                       r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                                                       payload_transfer: Some(resp_pt),
+                                                                                       ..Default::default()
+                                                                                   }),
+                                                                               };
+                                                                               
+                                                                               let mut resp_offline_buf = Vec::new();
+                                                                               resp_offline.encode(&mut resp_offline_buf)?;
+                                                                               
+                                                                               let d2d_resp = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                                   sequence_number: Some(5), 
+                                                                                   message: Some(resp_offline_buf),
+                                                                               };
+                                                                               let mut d2d_resp_buf = Vec::new();
+                                                                               d2d_resp.encode(&mut d2d_resp_buf)?;
+                                                                               
+                                                                               let gcm_meta = crate::proto::ukey2::GcmMetadata {
+                                                                                   r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
+                                                                                   version: Some(1),
+                                                                               };
+                                                                               let mut meta_bytes = Vec::new();
+                                                                               gcm_meta.encode(&mut meta_bytes)?;
+                                                                               
+                                                                               let encrypted_resp = engine.encrypt_and_sign(&d2d_resp_buf, Some(&meta_bytes))?;
+                                                                               let len_prefix = (encrypted_resp.len() as u32).to_be_bytes();
+                                                                               socket.write_all(&len_prefix).await?;
+                                                                               socket.write_all(&encrypted_resp).await?;
+                                                                               println!("TCP Handler: Sent RESPONSE (ACCEPT) in PayloadTransfer!");
+                                                                               
+                                                                               // Send END marker
+                                                                               let resp_end_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
+                                                                                   flags: Some(1), // LAST_CHUNK
+                                                                                   offset: Some(resp_buf_len),
+                                                                                   body: None,
+                                                                               };
+                                                                               
+                                                                               let resp_end_pt = crate::proto::quick_share::PayloadTransfer {
+                                                                                   packet_type: Some(crate::proto::quick_share::payload_transfer::PacketType::Data.into()),
+                                                                                   payload_header: Some(resp_header),
+                                                                                   payload_chunk: Some(resp_end_chunk),
+                                                                                   control_message: None,
+                                                                               };
+                                                                               
+                                                                               let resp_end_offline = crate::proto::quick_share::OfflineFrame {
+                                                                                   version: Some(1),
+                                                                                   v1: Some(crate::proto::quick_share::V1Frame {
+                                                                                       r#type: Some(crate::proto::quick_share::v1_frame::FrameType::PayloadTransfer.into()),
+                                                                                       payload_transfer: Some(resp_end_pt),
+                                                                                       ..Default::default()
+                                                                                   }),
+                                                                               };
+                                                                               
+                                                                               let mut resp_end_buf = Vec::new();
+                                                                               resp_end_offline.encode(&mut resp_end_buf)?;
+                                                                               
+                                                                               let d2d_resp_end = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                                   sequence_number: Some(6), 
+                                                                                   message: Some(resp_end_buf),
+                                                                               };
+                                                                               let mut d2d_resp_end_buf = Vec::new();
+                                                                               d2d_resp_end.encode(&mut d2d_resp_end_buf)?;
+                                                                               
+                                                                               let encrypted_resp_end = engine.encrypt_and_sign(&d2d_resp_end_buf, Some(&meta_bytes))?;
+                                                                               let end_len_prefix = (encrypted_resp_end.len() as u32).to_be_bytes();
+                                                                               socket.write_all(&end_len_prefix).await?;
+                                                                               socket.write_all(&encrypted_resp_end).await?;
+                                                                               println!("TCP Handler: Sent RESPONSE END marker!");
                                                                            }
                                                                       } else if frame_type == 12 { // KEEP_ALIVE
                                                                            println!("TCP Handler: 💓 Received KEEP_ALIVE, responding with ack...");
