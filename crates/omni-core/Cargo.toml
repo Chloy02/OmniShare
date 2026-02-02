@@ -1,0 +1,35 @@
+[package]
+name = "omni-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["linux"]
+linux = ["bluer", "zbus"]
+
+[dependencies]
+# Workspace shared
+anyhow.workspace = true
+tokio.workspace = true
+prost.workspace = true
+hex.workspace = true
+rand.workspace = true
+ring.workspace = true
+aes.workspace = true
+cbc.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+futures.workspace = true
+
+# Platform-specific (Linux)
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
+zbus = { version = "4.0", features = ["tokio"], optional = true }
+
+# Cross-platform
+mdns-sd = "0.10"
+base64 = "0.22"
+uuid = "1.0"
+byteorder = "1.5"
+
+[build-dependencies]
+prost-build = "0.12"

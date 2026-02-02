@@ -1,0 +1,22 @@
+// Include the generated Protobuf code.
+// The file names correspond to the 'package' specifier in the .proto files.
+
+pub mod quick_share {
+    // package location.nearby.connections;
+    include!(concat!(env!("OUT_DIR"), "/location.nearby.connections.rs"));
+}
+
+pub mod ukey2 {
+    // package securegcm;
+    include!(concat!(env!("OUT_DIR"), "/securegcm.rs"));
+}
+
+pub mod securemessage {
+    // package securemessage;
+    include!(concat!(env!("OUT_DIR"), "/securemessage.rs"));
+}
+
+pub mod wire_format {
+    // package sharing.nearby;
+    include!(concat!(env!("OUT_DIR"), "/sharing.nearby.rs"));
+}

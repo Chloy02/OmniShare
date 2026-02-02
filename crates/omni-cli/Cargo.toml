@@ -1,0 +1,14 @@
+[package]
+name = "omni-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "omnishare"
+path = "src/main.rs"
+
+[dependencies]
+omni-core = { path = "../omni-core" }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
