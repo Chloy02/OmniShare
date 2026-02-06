@@ -3,7 +3,9 @@
 //! Command-line interface for the OmniShare file transfer service.
 
 use clap::{Parser, Subcommand};
-use omni_core::{discovery, connection_manager::ConnectionManager, generate_endpoint_id, Config};
+use omni_core::{discovery, connection_manager::ConnectionManager, generate_endpoint_id, Config, TransferDelegate, TransferRequest};
+use async_trait::async_trait;
+use std::sync::Arc;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -70,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
                 discovery::ble_native::run_forever(endpoint_id_clone),
                 
                 // TCP Server with custom download directory
-                ConnectionManager::start_server(download_path)
+                ConnectionManager::start_server(download_path, Some(Arc::new(ConsoleDelegate)))
             );
         },
         Commands::Send { file } => {
@@ -121,4 +123,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+struct ConsoleDelegate;
+
+#[async_trait]
+impl TransferDelegate for ConsoleDelegate {
+    async fn on_transfer_request(&self, request: TransferRequest) -> bool {
+        println!("\n╔════════════════════════════════════════════════════╗");
+        println!("║       📥 INCOMING FILE TRANSFER REQUEST            ║");
+        println!("╠════════════════════════════════════════════════════╣");
+        println!("║ From: {:<44} ║", request.sender_name);
+        for file in &request.files {
+           println!("║ 📁 {:<46} ║", file.name);
+           println!("║    {:<46} ║", format!("{} bytes", file.size));
+        }
+        println!("╚════════════════════════════════════════════════════╝");
+        println!("✅ Auto-accepting (CLI mode)");
+        true
+    }
 }
