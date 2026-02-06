@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod connection_manager;
 pub mod security;
 pub mod proto;
+pub mod transfer;
 
 // Re-export main types for convenience
 pub use connection_manager::ConnectionManager;

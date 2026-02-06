@@ -48,7 +48,7 @@ message Ukey2ClientInit {
 
 message CipherCommitment {
   optional int32 handshake_cipher = 1;
-  optional bytes random = 2;
+  optional bytes commitment = 2;
 }
 
 message Ukey2ServerInit {

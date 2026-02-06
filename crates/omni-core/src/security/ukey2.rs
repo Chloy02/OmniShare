@@ -1,7 +1,18 @@
 use anyhow::{anyhow, Result};
-use ring::{agreement, rand, hkdf, hmac};
+use ring::{agreement, rand};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use prost::Message;
 use crate::proto::ukey2::{Ukey2Message, ukey2_message::Type as Ukey2Type, Ukey2ClientInit, Ukey2ServerInit, Ukey2ClientFinished, GenericPublicKey, EcP256PublicKey};
+
+/// HKDF-Extract-Expand helper function matching rquickshare's implementation
+fn hkdf_extract_expand(salt: &[u8], ikm: &[u8], info: &[u8], output_len: usize) -> Result<Vec<u8>> {
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), ikm);
+    let mut okm = vec![0u8; output_len];
+    hkdf.expand(info, &mut okm)
+        .map_err(|_| anyhow!("HKDF expand failed"))?;
+    Ok(okm)
+}
 
 /// The UKEY2 Protocol Version we support (v1).
 const UKEY2_VERSION: i32 = 1;
@@ -167,71 +178,35 @@ impl Ukey2ServerPending {
         let mut transcript = Vec::new();
         transcript.extend_from_slice(&self._client_init_bytes);
         transcript.extend_from_slice(&self._server_init_bytes);
-        let transcript_slice = [transcript.as_slice()];
         
-        // Derive Auth String
-        let salt_auth = hkdf::Salt::new(hkdf::HKDF_SHA256, b"UKEY2 v1 auth");
-        let prk_auth = salt_auth.extract(&shared_secret);
-        let okm_auth = prk_auth.expand(&transcript_slice, hmac::HMAC_SHA256)
-            .map_err(|_| anyhow!("HKDF Expand Auth Failed"))?;
-        let mut auth_string = vec![0u8; 32];
-        okm_auth.fill(&mut auth_string).map_err(|_| anyhow!("HKDF Fill Auth Failed"))?;
+        // Derive Auth String (using hkdf crate like rquickshare)
+        let auth_string = hkdf_extract_expand(b"UKEY2 v1 auth", &shared_secret, &transcript, 32)?;
 
         // Derive Next Protocol Secret
-        let salt_next = hkdf::Salt::new(hkdf::HKDF_SHA256, b"UKEY2 v1 next");
-        let prk_next = salt_next.extract(&shared_secret);
-        let okm_next = prk_next.expand(&transcript_slice, hmac::HMAC_SHA256)
-            .map_err(|_| anyhow!("HKDF Expand Next Protocol Failed"))?;
-        let mut next_protocol_secret = vec![0u8; 32];
-        okm_next.fill(&mut next_protocol_secret).map_err(|_| anyhow!("HKDF Fill Next Protocol Failed"))?;
+        let next_protocol_secret = hkdf_extract_expand(b"UKEY2 v1 next", &shared_secret, &transcript, 32)?;
 
         // --- DERIVATION PHASE 2: D2D KEYS (From Next Protocol Secret) ---
-        // Salt for D2D derivation
-        let d2d_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap());
-        let d2d_prk = d2d_salt.extract(&next_protocol_secret);
-
-        let info_client = [b"client".as_slice()];
-        let okm_client = d2d_prk.expand(&info_client, hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF D2D Client Failed"))?;
-        let mut d2d_client_key = vec![0u8; 32];
-        okm_client.fill(&mut d2d_client_key).map_err(|_| anyhow!("HKDF Fill D2D Client Failed"))?;
-
-        let info_server = [b"server".as_slice()];
-        let okm_server = d2d_prk.expand(&info_server, hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF D2D Server Failed"))?;
-        let mut d2d_server_key = vec![0u8; 32];
-        okm_server.fill(&mut d2d_server_key).map_err(|_| anyhow!("HKDF Fill D2D Server Failed"))?;
+        let d2d_salt = hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap();
+        let d2d_client_key = hkdf_extract_expand(&d2d_salt, &next_protocol_secret, b"client", 32)?;
+        let d2d_server_key = hkdf_extract_expand(&d2d_salt, &next_protocol_secret, b"server", 32)?;
 
         // --- DERIVATION PHASE 3: SECURE MESSAGE KEYS (AES & HMAC) ---
         // "All four use the same value of salt, which is SHA256('SecureMessage')"
         // BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E
-        let sm_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap());
+        let sm_salt = hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap();
         
-        // SERVER (That's US): We ENCRYPT with Server Key, DECRYPT with Client Key.
-        // Wait, the doc says: "If you're the client, they need to be swapped... Decrypt/Receive should use Server Key".
-        // Since we are the SERVER:
-        // We DECRYPT messages from Client using D2D Client Key. 
-        // We ENCRYPT messages to Client using D2D Server Key.
+        // SERVER (That's US in inbound handler):
+        // - We DECRYPT messages FROM the CLIENT (Android), so use D2D_CLIENT_KEY
+        // - We ENCRYPT messages TO the CLIENT, so use D2D_SERVER_KEY
 
-        // Decrypt Key (IKM = D2D Client Key, Info = "ENC:2")
-        let pt_decrypt = sm_salt.extract(&d2d_client_key);
-        let okm_decrypt = pt_decrypt.expand(&[b"ENC:2"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Decrypt Key Failed"))?;
-        let mut decrypt_key = vec![0u8; 32];
-        okm_decrypt.fill(&mut decrypt_key).map_err(|_| anyhow!("HKDF Fill Decrypt Key Failed"))?;
-
-        // Receive HMAC Key (IKM = D2D Client Key, Info = "SIG:1")
-        let okm_recv_hmac = pt_decrypt.expand(&[b"SIG:1"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Recv HMAC Key Failed"))?;
-        let mut receive_hmac_key = vec![0u8; 32];
-        okm_recv_hmac.fill(&mut receive_hmac_key).map_err(|_| anyhow!("HKDF Fill Recv HMAC Key Failed"))?;
-
-        // Encrypt Key (IKM = D2D Server Key, Info = "ENC:2")
-        let pt_encrypt = sm_salt.extract(&d2d_server_key);
-        let okm_encrypt = pt_encrypt.expand(&[b"ENC:2"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Encrypt Key Failed"))?;
-        let mut encrypt_key = vec![0u8; 32];
-        okm_encrypt.fill(&mut encrypt_key).map_err(|_| anyhow!("HKDF Fill Encrypt Key Failed"))?;
-
-        // Send HMAC Key (IKM = D2D Server Key, Info = "SIG:1")
-        let okm_send_hmac = pt_encrypt.expand(&[b"SIG:1"], hmac::HMAC_SHA256).map_err(|_| anyhow!("HKDF Send HMAC Key Failed"))?;
-        let mut send_hmac_key = vec![0u8; 32];
-        okm_send_hmac.fill(&mut send_hmac_key).map_err(|_| anyhow!("HKDF Fill Send HMAC Key Failed"))?;
+        // Decrypt Key (IKM = D2D Client Key - messages FROM client)
+        let decrypt_key = hkdf_extract_expand(&sm_salt, &d2d_client_key, b"ENC:2", 32)?;
+        // Receive HMAC Key (IKM = D2D Client Key - verify HMACs FROM client)
+        let receive_hmac_key = hkdf_extract_expand(&sm_salt, &d2d_client_key, b"SIG:1", 32)?;
+        // Encrypt Key (IKM = D2D Server Key - our messages TO client)
+        let encrypt_key = hkdf_extract_expand(&sm_salt, &d2d_server_key, b"ENC:2", 32)?;
+        // Send HMAC Key (IKM = D2D Server Key - sign our messages)
+        let send_hmac_key = hkdf_extract_expand(&sm_salt, &d2d_server_key, b"SIG:1", 32)?;
 
         Ok(Ukey2SessionKeys {
             auth_string,
@@ -266,5 +241,249 @@ fn from_java_bigint(bytes: &[u8]) -> Vec<u8> {
         bytes[split_idx..].to_vec()
     } else {
         bytes.to_vec()
+    }
+}
+
+// ============================================================================
+// UKEY2 CLIENT (For Outbound Connections - We are the initiator)
+// ============================================================================
+
+/// Initial State: We generate our keys and send ClientInit.
+pub struct Ukey2Client {
+    my_private_key: agreement::EphemeralPrivateKey,
+    pub my_public_key_bytes: Vec<u8>,
+    client_init_bytes: Vec<u8>,
+    client_finished_bytes: Vec<u8>,
+}
+
+/// State after sending ClientInit: We are waiting for ServerInit.
+pub struct Ukey2ClientPending {
+    my_private_key: agreement::EphemeralPrivateKey,
+    client_init_bytes: Vec<u8>,
+    _client_finished_bytes: Vec<u8>,
+    server_init_bytes: Vec<u8>,
+}
+
+impl Ukey2Client {
+    /// Create a new UKEY2 client and generate ClientInit message.
+    /// Returns (client_init_message, Ukey2Client)
+    pub fn new() -> Result<(Vec<u8>, Self)> {
+        let rng = rand::SystemRandom::new();
+        let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
+            .map_err(|_| anyhow!("Failed to generate ECDH keypair"))?;
+        
+        // Compute Public Key
+        let my_public_key_bytes = my_private_key.compute_public_key()
+            .map_err(|_| anyhow!("Failed to compute public key"))?
+            .as_ref()
+            .to_vec();
+
+        // Construct EcP256PublicKey for ClientFinished
+        let x_raw = &my_public_key_bytes[1..33];
+        let y_raw = &my_public_key_bytes[33..65];
+
+        let ec_key = EcP256PublicKey {
+            x: Some(to_java_bigint(x_raw)),
+            y: Some(to_java_bigint(y_raw)),
+        };
+
+        let my_generic_public_key = GenericPublicKey {
+            r#type: Some(1), // 1 = EC_P256
+            ec_p256_public_key: Some(ec_key),
+        };
+
+        // Pre-construct ClientFinished (needed for commitment in ClientInit)
+        let client_finished = Ukey2ClientFinished {
+            public_key: Some(my_generic_public_key),
+        };
+        let mut client_finished_bytes = Vec::new();
+        client_finished.encode(&mut client_finished_bytes)?;
+
+        // Wrap in Ukey2Message for ClientFinished
+        let client_finished_msg = Ukey2Message {
+            message_type: Some(Ukey2Type::ClientFinished.into()),
+            message_data: Some(client_finished_bytes.clone()),
+        };
+        let mut client_finished_outer = Vec::new();
+        client_finished_msg.encode(&mut client_finished_outer)?;
+
+        // Create SHA-512 commitment of ClientFinished
+        use sha2::{Digest, Sha512};
+        let commitment = Sha512::digest(&client_finished_outer).to_vec();
+
+        // Generate random bytes
+        let random_bytes: [u8; 32] = rand::generate(&rng)
+            .map_err(|_| anyhow!("Random gen failed"))?
+            .expose();
+
+        // Construct ClientInit
+        use crate::proto::ukey2::CipherCommitment;
+        let client_init = Ukey2ClientInit {
+            version: Some(UKEY2_VERSION),
+            random: Some(random_bytes.to_vec()),
+            cipher_commitments: vec![CipherCommitment {
+                handshake_cipher: Some(100), // 100 = P256_SHA512
+                commitment: Some(commitment),
+            }],
+            next_protocol: Some(b"AES_256_CBC-HMAC_SHA256".to_vec()),
+        };
+
+        let mut client_init_inner = Vec::new();
+        client_init.encode(&mut client_init_inner)?;
+
+        // Wrap in Ukey2Message
+        let client_init_msg = Ukey2Message {
+            message_type: Some(Ukey2Type::ClientInit.into()),
+            message_data: Some(client_init_inner),
+        };
+        let mut client_init_bytes = Vec::new();
+        client_init_msg.encode(&mut client_init_bytes)?;
+
+        println!("UKEY2 Client: Generated ClientInit ({} bytes)", client_init_bytes.len());
+
+        Ok((client_init_bytes.clone(), Self {
+            my_private_key,
+            my_public_key_bytes,
+            client_init_bytes,
+            client_finished_bytes: client_finished_outer,
+        }))
+    }
+
+    /// Process ServerInit and transition to pending state.
+    pub fn handle_server_init(self, server_init_outer_bytes: &[u8]) -> Result<(Vec<u8>, Ukey2ClientPending)> {
+        // 1. Decode outer Ukey2Message
+        let ukey_msg = Ukey2Message::decode(server_init_outer_bytes)?;
+        let server_init_data = ukey_msg.message_data.ok_or(anyhow!("Missing message_data in ServerInit"))?;
+        
+        // 2. Decode ServerInit
+        let server_init = Ukey2ServerInit::decode(server_init_data.as_slice())?;
+        println!("UKEY2 Client: Received ServerInit. Version: {:?}, Cipher: {:?}", 
+                 server_init.version, server_init.handshake_cipher);
+
+        // Validate version and cipher
+        if server_init.version != Some(1) {
+            return Err(anyhow!("Unsupported UKEY2 version"));
+        }
+        if server_init.handshake_cipher != Some(100) {
+            return Err(anyhow!("Unsupported handshake cipher"));
+        }
+
+        // 3. Return ClientFinished message
+        println!("UKEY2 Client: Sending ClientFinished ({} bytes)", self.client_finished_bytes.len());
+
+        Ok((self.client_finished_bytes.clone(), Ukey2ClientPending {
+            my_private_key: self.my_private_key,
+            client_init_bytes: self.client_init_bytes,
+            _client_finished_bytes: self.client_finished_bytes,
+            server_init_bytes: server_init_outer_bytes.to_vec(),
+        }))
+    }
+}
+
+impl Ukey2ClientPending {
+    /// Finalize the handshake by deriving keys.
+    /// Call this after receiving the peer's ConnectionResponse.
+    pub fn finalize(self, server_init_outer_bytes: &[u8]) -> Result<Ukey2SessionKeys> {
+        // 1. Extract server's public key from ServerInit
+        let ukey_msg = Ukey2Message::decode(server_init_outer_bytes)?;
+        let server_init_data = ukey_msg.message_data.ok_or(anyhow!("Missing message_data"))?;
+        let server_init = Ukey2ServerInit::decode(server_init_data.as_slice())?;
+        
+        let generic_pk = server_init.public_key.ok_or(anyhow!("Missing Server Public Key"))?;
+        let ec_key = generic_pk.ec_p256_public_key.ok_or(anyhow!("Missing EC Key"))?;
+        let x_pad = ec_key.x.ok_or(anyhow!("Missing X coordinate"))?;
+        let y_pad = ec_key.y.ok_or(anyhow!("Missing Y coordinate"))?;
+        
+        println!("DEBUG: Raw X len={}, Raw Y len={}", x_pad.len(), y_pad.len());
+        
+        let x = from_java_bigint(&x_pad);
+        let y = from_java_bigint(&y_pad);
+
+        println!("DEBUG: After from_java_bigint: X len={}, Y len={}", x.len(), y.len());
+
+        // Reconstruct [0x04, X, Y]
+        let mut peer_public_key_bytes = Vec::with_capacity(65);
+        peer_public_key_bytes.push(0x04);
+        // Ensure 32 bytes each, pad with leading zeros if needed
+        let x_padded: Vec<u8> = std::iter::repeat(0u8).take(32_usize.saturating_sub(x.len())).chain(x.iter().cloned()).collect();
+        let y_padded: Vec<u8> = std::iter::repeat(0u8).take(32_usize.saturating_sub(y.len())).chain(y.iter().cloned()).collect();
+        peer_public_key_bytes.extend_from_slice(&x_padded);
+        peer_public_key_bytes.extend_from_slice(&y_padded);
+        
+        println!("DEBUG: Final point: X_padded len={}, Y_padded len={}, Total len={}", 
+                 x_padded.len(), y_padded.len(), peer_public_key_bytes.len());
+
+        // 2. Perform ECDH
+        let peer_public_key = agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &peer_public_key_bytes);
+        
+        let shared_secret = agreement::agree_ephemeral(
+            self.my_private_key,
+            &peer_public_key,
+            |key_material| key_material.to_vec(),
+        ).map_err(|_| anyhow!("ECDH Agreement Failed"))?;
+
+        // SHA256 hash of raw ECDH secret
+        // SHA256 hash of raw ECDH secret
+        use sha2::{Digest, Sha256};
+        let shared_secret = Sha256::digest(&shared_secret).to_vec();
+        println!("DEBUG: Shared Secret Len: {}", shared_secret.len());
+        println!("DEBUG: Peer Public Key (padded): X len={}, Y len={}", x_padded.len(), y_padded.len());
+
+        // 3. Build transcript: M_1|M_2 (ClientInit | ServerInit)
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(&self.client_init_bytes);
+        transcript.extend_from_slice(&self.server_init_bytes);
+
+        // 4. Derive Auth String (using hkdf crate like rquickshare)
+        let auth_string = hkdf_extract_expand(b"UKEY2 v1 auth", &shared_secret, &transcript, 32)?;
+
+        // 5. Derive Next Protocol Secret
+        let next_protocol_secret = hkdf_extract_expand(b"UKEY2 v1 next", &shared_secret, &transcript, 32)?;
+
+        // 6. Derive D2D Keys
+        let d2d_salt = hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap();
+        let d2d_client_key = hkdf_extract_expand(&d2d_salt, &next_protocol_secret, b"client", 32)?;
+        let d2d_server_key = hkdf_extract_expand(&d2d_salt, &next_protocol_secret, b"server", 32)?;
+
+        // 7. Derive SecureMessage Keys
+        // CRITICAL: As CLIENT, keys are SWAPPED compared to server:
+        // - We ENCRYPT with Client Key (we are the client)
+        // - We DECRYPT with Server Key (messages from server)
+        let sm_salt = hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap();
+
+        // Encrypt Key (IKM = D2D Client Key - we are client)
+        let encrypt_key = hkdf_extract_expand(&sm_salt, &d2d_client_key, b"ENC:2", 32)?;
+        // Send HMAC Key (IKM = D2D Client Key)
+        let send_hmac_key = hkdf_extract_expand(&sm_salt, &d2d_client_key, b"SIG:1", 32)?;
+
+        // Decrypt Key (IKM = D2D Server Key - messages from server)
+        let decrypt_key = hkdf_extract_expand(&sm_salt, &d2d_server_key, b"ENC:2", 32)?;
+        // Receive HMAC Key (IKM = D2D Server Key)
+        let receive_hmac_key = hkdf_extract_expand(&sm_salt, &d2d_server_key, b"SIG:1", 32)?;
+
+        // ==== DEBUG: Print all derived keys (first 8 bytes hex) ====
+        println!("=== UKEY2 Key Derivation Debug ===");
+        println!("  Transcript Len: {} (ClientInit={}, ServerInit={})", 
+                 transcript.len(), self.client_init_bytes.len(), self.server_init_bytes.len());
+        println!("  Shared Secret (first 8): {}", hex::encode(&shared_secret[..8]));
+        println!("  Next Protocol Secret (first 8): {}", hex::encode(&next_protocol_secret[..8]));
+        println!("  D2D Client Key (first 8): {}", hex::encode(&d2d_client_key[..8]));
+        println!("  D2D Server Key (first 8): {}", hex::encode(&d2d_server_key[..8]));
+        println!("  --- SecureMessage Keys (CLIENT role) ---");
+        println!("  Encrypt Key (first 8): {}", hex::encode(&encrypt_key[..8]));
+        println!("  Send HMAC Key (first 8): {}", hex::encode(&send_hmac_key[..8]));
+        println!("  Decrypt Key (first 8): {}", hex::encode(&decrypt_key[..8]));
+        println!("  Recv HMAC Key (first 8): {}", hex::encode(&receive_hmac_key[..8]));
+        println!("==================================");
+
+        Ok(Ukey2SessionKeys {
+            auth_string,
+            d2d_client_key,
+            d2d_server_key,
+            decrypt_key,
+            receive_hmac_key,
+            encrypt_key,
+            send_hmac_key,
+        })
     }
 }
