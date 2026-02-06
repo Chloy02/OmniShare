@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod connection_manager;
 pub mod security;
 pub mod proto;
+pub mod transfer;
 
 // Re-export main types for convenience
 pub use connection_manager::ConnectionManager;
@@ -55,6 +56,16 @@ pub struct FileInfo {
     pub mime_type: String,
     /// Internal payload ID (for protocol tracking)
     pub payload_id: i64,
+}
+
+use async_trait::async_trait;
+
+/// Delegate trait for handling user interaction during file transfer negotiation
+#[async_trait]
+pub trait TransferDelegate: Send + Sync {
+    /// Called when an incoming file transfer request is received (Introduction Level).
+    /// Returns `true` to accept the transfer, `false` to reject it.
+    async fn on_transfer_request(&self, request: TransferRequest) -> bool;
 }
 
 /// Generate a random endpoint ID for device identification

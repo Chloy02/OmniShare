@@ -3,8 +3,11 @@
 //! Command-line interface for the OmniShare file transfer service.
 
 use clap::{Parser, Subcommand};
-use omni_core::{discovery, connection_manager::ConnectionManager, generate_endpoint_id, Config};
+use omni_core::{discovery, connection_manager::ConnectionManager, generate_endpoint_id, Config, TransferDelegate, TransferRequest};
+use async_trait::async_trait;
+use std::sync::Arc;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "omnishare")]
@@ -21,6 +24,12 @@ enum Commands {
         /// Directory to save received files (default: ~/Downloads)
         #[arg(long, short = 'd')]
         download_dir: Option<PathBuf>,
+    },
+    /// Send files to nearby devices
+    Send {
+        /// Files to send
+        #[arg(long, short = 'f', required = true)]
+        file: Vec<PathBuf>,
     },
     /// Manually trigger a connection (Debug)
     Connect {
@@ -63,13 +72,74 @@ async fn main() -> anyhow::Result<()> {
                 discovery::ble_native::run_forever(endpoint_id_clone),
                 
                 // TCP Server with custom download directory
-                ConnectionManager::start_server(download_path)
+                ConnectionManager::start_server(download_path, Some(Arc::new(ConsoleDelegate)))
             );
+        },
+        Commands::Send { file } => {
+            println!("📤 OmniShare File Sender");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━");
+            
+            // Validate files exist
+            for f in file {
+                if !f.exists() {
+                    println!("❌ File not found: {}", f.display());
+                    return Ok(());
+                }
+                println!("   📁 {}", f.display());
+            }
+            
+            // Discover nearby devices
+            println!();
+            let devices = discovery::scanner::discover_devices(Duration::from_secs(5)).await?;
+            
+            if devices.is_empty() {
+                println!("❌ No Quick Share devices found nearby.");
+                println!("   Make sure the Android device has Quick Share enabled and is nearby.");
+                return Ok(());
+            }
+            
+            // Display device list
+            println!();
+            println!("📱 Nearby Devices:");
+            for (i, device) in devices.iter().enumerate() {
+                println!("   [{}] {} ({})", i + 1, device.name, device.ip);
+            }
+            
+            // For now, auto-select first device (TODO: interactive selection)
+            let target = &devices[0];
+            println!();
+            println!("🎯 Connecting to: {}", target.name);
+            
+            // Send files
+            omni_core::transfer::outbound::send_files(
+                target.clone(),
+                file.clone(),
+                "OmniShare",
+            ).await?;
         },
         Commands::Connect { ip } => {
             println!("Connecting to {}...", ip);
-            // TODO: Implement outbound connection
+            // TODO: Implement manual outbound connection
         }
     }
     Ok(())
+}
+
+struct ConsoleDelegate;
+
+#[async_trait]
+impl TransferDelegate for ConsoleDelegate {
+    async fn on_transfer_request(&self, request: TransferRequest) -> bool {
+        println!("\n╔════════════════════════════════════════════════════╗");
+        println!("║       📥 INCOMING FILE TRANSFER REQUEST            ║");
+        println!("╠════════════════════════════════════════════════════╣");
+        println!("║ From: {:<44} ║", request.sender_name);
+        for file in &request.files {
+           println!("║ 📁 {:<46} ║", file.name);
+           println!("║    {:<46} ║", format!("{} bytes", file.size));
+        }
+        println!("╚════════════════════════════════════════════════════╝");
+        println!("✅ Auto-accepting (CLI mode)");
+        true
+    }
 }

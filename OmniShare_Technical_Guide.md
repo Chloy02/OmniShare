@@ -1,8 +1,8 @@
 # OmniShare: The Internals (Deep Dive)
 
-**Version:** 3.0 (The File Transfer Edition)  
+**Version:** 4.0 (The Robustness & GUI Edition)  
 **Target Audience:** Systems Engineers, Security Researchers, Cryptographers, Protocol Developers.  
-**Status:** ✅ Working - Successfully receiving files from Android devices
+**Status:** ✅ Working - Reliable file reception with GUI & CLI support.
 
 ---
 
@@ -146,7 +146,7 @@ Our implementation implements a "Strategy 2" decoder:
 
 ## 5. Part 4: File Transfer Protocol
 
-This section documents the complete file transfer flow, including critical bugs we encountered and fixes.
+This section documents the complete file transfer flow, with a focus on recent stability fixes (v4.0).
 
 ### 5.1 The Complete Transfer Handshake
 
@@ -168,15 +168,17 @@ This section documents the complete file transfer flow, including critical bugs 
        │                                          │
        │         ═══ ENCRYPTED MODE ═══          │
        │                                          │
-       │  <────── PAIRED_KEY_ENCRYPTION ───────── │  Wrapped in PayloadTransfer
-       │  ─────── PAIRED_KEY_ENCRYPTION ───────>  │  Wrapped in PayloadTransfer
+       │  <────── PAIRED_KEY_ENCRYPTION ───────── │  Wrapped in PayloadTransfer (Seq: 1)
+       │  ─────── PAIRED_KEY_ENCRYPTION ───────>  │  Wrapped (Seq: 1)
        │                                          │
        │  <────── PAIRED_KEY_RESULT (UNABLE) ──── │  We don't have paired keys
-       │  ─────── PAIRED_KEY_RESULT (UNABLE) ──>  │  Phone doesn't either
+       │  ─────── PAIRED_KEY_RESULT (UNABLE) ──>  │  Phone doesn't either (Seq: 2)
        │                                          │
        │  ─────── INTRODUCTION ────────────────>  │  File metadata (name, size, payload_id)
-       │  <────── RESPONSE (ACCEPT) ───────────── │  We accept the transfer
-       │  ─────── RESPONSE (ACCEPT) ───────────>  │  Phone confirms, ready to send
+       │  <────── KEEP_ALIVE (ACK) ─────────────  │  We ack heartbeats regularly (Seq: 3, 4...)
+       │                                          │
+       │  <────── RESPONSE (ACCEPT) ───────────── │  User Clicks Accept! (Seq: N)
+       │  ─────── RESPONSE (ACCEPT) ───────────>  │  Phone confirms (Seq: N+1)
        │                                          │
        │  ─────── FILE_CHUNKS (Type=FILE) ─────>  │  Actual file data
        │  ─────── FILE_CHUNKS (Type=FILE) ─────>  │  ...multiple chunks...
@@ -185,165 +187,73 @@ This section documents the complete file transfer flow, including critical bugs 
        │  ═══════ FILE SAVED TO DISK ════════════ │
 ```
 
-### 5.2 Critical Bug #1: PayloadTransfer Wrapping for Outgoing Frames
+### 5.2 Critical Fix: Dynamic Sequence Numbers (v4.0)
 
-**Symptom:** Phone receives our frames but doesn't respond, eventually times out.
+**The Issue:**
+The connection would drop immediately after the user accepted the transfer, or randomly after `KeepAlive` frames. This was typically flagged as "Early EOF" or a sudden socket close by the client.
 
-**Root Cause:** We were sending raw `SharingFrame` messages, but the protocol requires ALL encrypted frames to be wrapped in `PayloadTransfer` + `OfflineFrame`.
+**The Root Cause:**
+The Android client enforces strictly **monotonic sequence numbers** for `DeviceToDeviceMessage` frames.
+*   We were hardcoding `sequence_number: Some(1)` or `Some(0)` in various places (PKE, PKR, Response, KeepAlive).
+*   If we sent `Seq: 1` (PKE), then `Seq: 1` (PKR), the client would reject the second frame as a replay attack or protocol violation and drop the connection.
 
-**Fix Implementation:**
+**The Fix:**
+We introduced a persistent `server_seq_num` variable in the connection handler, initialized to `-1` (or 0) after the handshake. It is incremented for **every** encrypted frame sent:
+*   PKE
+*   PKR
+*   KeepAlive Acks
+*   Accept/Reject Responses
+
+This ensures the sequence is always $N, N+1, N+2...$, satisfying the client's security checks.
+
+### 5.3 Critical Fix: `LastChunk` Handling for `ACCEPT`
+
+The `RESPONSE` (Accept) frame is wrapped in a `PayloadTransfer`. The protocol dictates that any `PayloadTransfer` must be terminated by a "Last Chunk" marker to signal the end of that specific message stream.
+
+**Incorrect Behavior:**
+We sent the `RESPONSE` frame wrapped in a `PayloadTransfer` but forgot the end marker. The client kept waiting for more "Response Data" and eventually timed out.
+
+**Correct Behavior:**
+Immediately after sending the `RESPONSE` payload, we send a second, empty `PayloadChunk` with `flags = 1` (LAST_CHUNK) for the *same* `payload_id`.
+
 ```rust
-// WRONG: Sending raw SharingFrame
-let frame = SharingFrame { ... };
-socket.write(frame.encode())?;
+// 1. Send Response Data
+let resp_chunk = PayloadChunk { flags: Some(0), body: Some(resp_buf), ... };
+send(resp_chunk);
 
-// CORRECT: Wrap in PayloadTransfer + OfflineFrame
-let sharing_frame = SharingFrame { ... };
-let sharing_bytes = sharing_frame.encode_to_vec();
-
-let payload_transfer = PayloadTransfer {
-    payload_header: Some(PayloadHeader {
-        id: Some(unique_payload_id),
-        r#type: Some(1), // BYTES for control messages
-        total_size: Some(sharing_bytes.len() as i64),
-        is_sensitive: Some(false),
-    }),
-    payload_chunk: Some(PayloadChunk {
-        offset: Some(0),
-        flags: Some(0), // 0 = more chunks coming
-        body: Some(sharing_bytes),
-    }),
-    ..Default::default()
-};
-
-let offline_frame = OfflineFrame {
-    version: Some(1),
-    v1: Some(V1Frame {
-        r#type: Some(3), // PAYLOAD_TRANSFER
-        payload_transfer: Some(payload_transfer),
-        ..Default::default()
-    }),
-};
-
-// Also must send END marker (flags=1, no body)
-let end_marker = create_end_marker(payload_id);
-```
-
-### 5.3 Critical Bug #2: LAST_CHUNK with Empty Body
-
-**Symptom:** File data is buffered correctly, but file never saves to disk.
-
-**Root Cause:** The `LAST_CHUNK` signal (flags=1) arrives in a **separate packet with no body**. Our save logic was inside the "if body exists" branch.
-
-**Debug Evidence:**
-```
-TCP Handler: PayloadChunk -> Flags: Some(1), Offset: Some(1880742), Body Len: None
-TCP Handler: PayloadChunk body is None  // <-- Save never triggered!
-```
-
-**Fix:** Handle LAST_CHUNK even when body is None:
-```rust
-if let Some(body) = &chunk.body {
-    // Buffer the chunk
-    file_buffers.entry(payload_id).or_insert_with(Vec::new).extend_from_slice(&body);
-    
-    if chunk.flags == Some(1) {
-        // LAST_CHUNK with data - save file
-        save_file(payload_id, &file_buffers, &file_metadata_map);
-    }
-} else {
-    // Body is None - but check if this is a LAST_CHUNK end marker!
-    if chunk.flags == Some(1) {
-        // LAST_CHUNK end marker (no body) - save file now!
-        save_file(payload_id, &file_buffers, &file_metadata_map);
-    }
-}
-```
-
-### 5.4 Critical Bug #3: RESPONSE Frame Not Handled
-
-**Symptom:** Phone says "Failed" immediately after we send ACCEPT.
-
-**Root Cause:** After we send `RESPONSE (ACCEPT)`, the phone sends back its own `RESPONSE (ACCEPT)` to confirm. We weren't handling this frame (logged as "Unhandled Sharing Frame Type: 2").
-
-**Debug Evidence:**
-```
-TCP Handler: ✨ SHARING FRAME TYPE: 2
-TCP Handler: ⚠️ Unhandled Sharing Frame Type: 2
-TCP Handler: Connection closed/EOF in Secure Loop.  // Phone disconnected!
-```
-
-**Key Insight:** The phone expects acknowledgment of its RESPONSE frame. Without it, the phone assumes failure and closes the connection before sending file data.
-
-**Fix:** Add handler for Type 2 (RESPONSE):
-```rust
-} else if frame_type == 2 { // RESPONSE (ConnectionResponseFrame)
-    println!("TCP Handler: 📬 Client's RESPONSE received!");
-    if let Some(conn_resp) = &v1.connection_response {
-        let status = conn_resp.status.unwrap_or(0);
-        if status == 1 {
-            println!("TCP Handler: ✅ Phone confirmed ACCEPT - file transfer should begin!");
-        }
-    }
-}
-```
-
-### 5.5 File Saving Implementation
-
-**State Tracking:**
-```rust
-// Maps to track incoming file transfers
-let mut file_metadata_map: HashMap<i64, (String, i64)> = HashMap::new(); // payload_id -> (filename, size)
-let mut file_buffers: HashMap<i64, Vec<u8>> = HashMap::new();           // payload_id -> accumulated bytes
-```
-
-**Populating Metadata (from INTRODUCTION frame):**
-```rust
-if let Some(intro) = &v1.introduction {
-    for file in &intro.file_metadata {
-        if let Some(payload_id) = file.payload_id {
-            let filename = file.name.clone().unwrap_or_else(|| format!("received_file_{}", payload_id));
-            let size = file.size.unwrap_or(0);
-            file_metadata_map.insert(payload_id, (filename, size));
-        }
-    }
-}
-```
-
-**Saving to Disk:**
-```rust
-// When LAST_CHUNK received (flags=1)
-if let Some(file_data) = file_buffers.remove(&payload_id) {
-    let filename = file_metadata_map
-        .get(&payload_id)
-        .map(|(name, _)| name.clone())
-        .unwrap_or_else(|| format!("received_file_{}", payload_id));
-    
-    let download_path = format!("{}/Downloads/{}", env::var("HOME").unwrap(), filename);
-    std::fs::write(&download_path, &file_data)?;
-}
+// 2. Send End Marker
+let end_chunk = PayloadChunk { flags: Some(1), body: None, ... };
+send(end_chunk);
 ```
 
 ---
 
-## 6. Debugging Techniques
+## 6. Architecture Update: GUI Integration
 
-### 6.1 Hex Dump Analysis
-When protobuf decoding fails, we dump raw hex to analyze wire format:
+### 6.1 The TransferDelegate Pattern
+
+To support both CLI and GUI interfaces without code duplication, we introduced the `TransferDelegate` trait.
+
 ```rust
-println!("RAW HEX: {}", hex::encode(&decrypted_bytes));
+#[async_trait]
+pub trait TransferDelegate: Send + Sync {
+    async fn on_transfer_request(&self, request: TransferRequest) -> bool;
+}
 ```
 
-### 6.2 Multi-Strategy Decoding
-We implement multiple decode strategies and try them in order:
-1. **Strategy 1 (Direct):** Decode as `SharingFrame` directly
-2. **Strategy 2 (Unwrap):** Decode as `OfflineFrame`, extract `PayloadTransfer.body`, decode as `SharingFrame`
+*   **CLI Mode:** Uses `ConsoleDelegate`. It prints ASCII art to stdout and auto-accepts (for now) or prompts for `y/n`.
+*   **GUI Mode:** Uses `TauriDelegate` (via MPSC channels). It fires a Tauri event `transfer-request` to the frontend.
 
-### 6.3 Payload ID Tracking
-Every file transfer uses unique `payload_id` values (64-bit signed integers, often negative). These must be tracked correctly:
-- INTRODUCTION provides `payload_id` for each file
-- File chunks arrive with matching `payload_id` in PayloadHeader
-- LAST_CHUNK uses same `payload_id` to signal completion
+### 6.2 Frontend-Backend Loop
+
+1.  **Core:** Receives `Introduction` frame. Parses metadata.
+2.  **Delegate:** Calls `on_transfer_request`.
+3.  **Tauri:** Emits event.
+4.  **JavaScript:** Listens for event, shows `<dialog>` modal with "Accept" / "Reject".
+5.  **User Action:** User clicks "Accept".
+6.  **Tauri Command:** `accept_transfer` command is invoked.
+7.  **Core:** Channel receiver gets the signal, `on_transfer_request` returns `true`.
+8.  **Connection Manager:** Sends `RESPONSE (ACCEPT)` frame. Transfer begins.
 
 ---
 
@@ -353,7 +263,8 @@ Every file transfer uses unique `payload_id` values (64-bit signed integers, oft
 2.  **Transport**: TCP Port 5200.
 3.  **Security**: UKEY2 Handshake → AES-256-CBC + HMAC-SHA256.
 4.  **Framing**: Length-Prefixed → SecureMessage → DeviceToDevice → OfflineFrame → [PayloadTransfer Wrapper] → SharingFrame.
-5.  **File Reception**: Buffer chunks by `payload_id`, save on `LAST_CHUNK` (flags=1).
+5.  **Reliability**: Dynamic Sequence Numbering + KeepAlive handling.
+6.  **File Reception**: Buffer chunks by `payload_id`, save on `LAST_CHUNK` (flags=1).
 
 This architecture ensures privacy (randomized MACs/Salts), security (Forward Secrecy via ECDH), and reliability (Chunked Payload Transfer).
 
@@ -361,8 +272,7 @@ This architecture ensures privacy (randomized MACs/Salts), security (Forward Sec
 
 ## 8. TODO / Future Work
 
-- [ ] **CLI Accept/Reject Prompt**: Currently auto-accepts all transfers. Add user confirmation.
-- [ ] **Progress Display**: Show transfer progress percentage during large file transfers.
-- [ ] **Multiple Files**: Test and verify handling of multi-file transfers.
-- [ ] **Sending Files**: Implement Linux → Android file transfer (outbound).
-- [ ] **Error Recovery**: Handle interrupted transfers gracefully.
+- [ ] **Phase 4: Progress Tracking**: Use the `TransferDelegate` to report byte progress to the GUI.
+- [ ] **Phase 5: Transfer History**: Persist transfer logs to SQLite.
+- [ ] **Phase 6: Settings**: Allow users to change the default download directory and device name.
+- [ ] **Outbound Transfer**: Re-visit the encryption issues blocking Linux-to-Android transfers.

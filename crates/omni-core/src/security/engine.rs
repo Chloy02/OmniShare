@@ -89,12 +89,19 @@ impl SecurityEngine {
 
         // 6. Wrap in SecureMessage
         let secure_msg = SecureMessage {
-            header_and_body: hb_bytes,
-            signature: signature,
+            header_and_body: hb_bytes.clone(),
+            signature: signature.clone(),
         };
 
         let mut final_bytes = Vec::new();
         secure_msg.encode(&mut final_bytes)?;
+
+        // DEBUG: Dump first 64 bytes of encrypted message structure
+        println!("DEBUG: SecureMessage structure:");
+        println!("  -> header_and_body len: {}", hb_bytes.len());
+        println!("  -> signature len: {}", signature.len());
+        println!("  -> final_bytes len: {}", final_bytes.len());
+        println!("  -> first 64 bytes: {}", hex::encode(&final_bytes[..std::cmp::min(64, final_bytes.len())]));
 
         Ok(final_bytes)
     }

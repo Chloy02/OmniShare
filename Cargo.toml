@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/omni-core",
     "crates/omni-cli",
+    "omni-gui/src-tauri",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ aes = "0.8"
 cbc = "0.1"
 hmac = "0.12"
 sha2 = "0.10"
+hkdf = "0.12"
 
 # Async
 futures = "0.3"
