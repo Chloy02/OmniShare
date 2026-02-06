@@ -3,8 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
-use omni_core::{discovery, connection_manager::ConnectionManager, generate_endpoint_id, Config};
+use omni_core::{discovery, connection_manager::ConnectionManager, generate_endpoint_id, TransferDelegate};
 use std::path::PathBuf;
+use std::collections::HashMap;
+use tauri::{Emitter, AppHandle};
+use async_trait::async_trait;
 
 /// Transfer request notification for frontend
 #[derive(Clone, Serialize, Deserialize)]
@@ -73,6 +76,7 @@ pub struct AppState {
     pub pending_transfers: Vec<TransferRequest>,
     pub transfer_history: Vec<TransferRecord>,
     pub service_abort_handle: Option<tokio::task::AbortHandle>,
+    pub transfer_confirmations: HashMap<u64, tokio::sync::oneshot::Sender<bool>>,
 }
 
 impl Default for AppState {
@@ -83,6 +87,7 @@ impl Default for AppState {
             pending_transfers: Vec::new(),
             transfer_history: Vec::new(),
             service_abort_handle: None,
+            transfer_confirmations: HashMap::new(),
         }
     }
 }
@@ -93,7 +98,7 @@ pub type SharedState = Arc<Mutex<AppState>>;
 
 /// Start the receiver (BLE advertising + TCP listener)
 #[tauri::command]
-pub async fn start_receiver(state: State<'_, SharedState>) -> Result<String, String> {
+pub async fn start_receiver(app: AppHandle, state: State<'_, SharedState>) -> Result<String, String> {
     let mut app_state = state.lock().await;
     if app_state.is_running {
         return Ok("Already running".to_string());
@@ -108,6 +113,8 @@ pub async fn start_receiver(state: State<'_, SharedState>) -> Result<String, Str
     let device_name = app_state.settings.device_name.clone();
 
     // Spawn the service task
+    let app_handle = app.clone();
+    let state_clone = state.inner().clone();
     let handle = tokio::spawn(async move {
         println!("GUI: Starting OmniShare Services...");
         
@@ -127,10 +134,16 @@ pub async fn start_receiver(state: State<'_, SharedState>) -> Result<String, Str
         println!("GUI: Starting BLE and TCP...");
         let endpoint_id_clone = endpoint_id.clone();
         
+        // Create delegate
+        let delegate = Arc::new(TauriTransferDelegate {
+            app: app_handle,
+            state: state_clone,
+        });
+
         // Run BLE and TCP concurrently
         let _ = tokio::join!(
             discovery::ble_native::run_forever(endpoint_id_clone),
-            ConnectionManager::start_server(download_dir)
+            ConnectionManager::start_server(download_dir, Some(delegate))
         );
     });
 
@@ -168,9 +181,16 @@ pub async fn accept_transfer(
     state: State<'_, SharedState>,
 ) -> Result<String, String> {
     let mut app_state = state.lock().await;
-    app_state.pending_transfers.retain(|t| t.id != transfer_id);
-    // TODO: Send accept signal to omni-core
-    Ok(format!("Transfer {} accepted", transfer_id))
+    
+    // Convert string ID back to u64
+    if let Ok(id) = transfer_id.parse::<u64>() {
+        if let Some(sender) = app_state.transfer_confirmations.remove(&id) {
+            let _ = sender.send(true);
+            return Ok(format!("Transfer {} accepted", transfer_id));
+        }
+    }
+    
+    Err("Transfer request not found".to_string())
 }
 
 /// Reject a pending transfer
@@ -180,9 +200,67 @@ pub async fn reject_transfer(
     state: State<'_, SharedState>,
 ) -> Result<String, String> {
     let mut app_state = state.lock().await;
-    app_state.pending_transfers.retain(|t| t.id != transfer_id);
-    // TODO: Send reject signal to omni-core
-    Ok(format!("Transfer {} rejected", transfer_id))
+    
+    // Convert string ID back to u64
+    if let Ok(id) = transfer_id.parse::<u64>() {
+        if let Some(sender) = app_state.transfer_confirmations.remove(&id) {
+            let _ = sender.send(false);
+            return Ok(format!("Transfer {} rejected", transfer_id));
+        }
+    }
+    
+    Err("Transfer request not found".to_string())
+}
+
+struct TauriTransferDelegate {
+    app: AppHandle,
+    state: SharedState,
+}
+
+#[async_trait]
+impl TransferDelegate for TauriTransferDelegate {
+    async fn on_transfer_request(&self, request: omni_core::TransferRequest) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = request.id;
+        
+        // 1. Store the channel sender
+        {
+            let mut state = self.state.lock().await;
+            state.transfer_confirmations.insert(request_id, tx);
+        }
+        
+        // 2. Emit event to frontend
+        // Convert to GUI-friendly struct
+        let gui_files: Vec<FileInfo> = request.files.iter().map(|f| FileInfo {
+            name: f.name.clone(),
+            size: f.size,
+            mime_type: f.mime_type.clone(),
+        }).collect();
+        
+        let gui_req = TransferRequest {
+            id: request.id.to_string(), // Convert u64 to String for JS
+            sender_name: request.sender_name,
+            files: gui_files,
+            total_size: request.files.iter().map(|f| f.size).sum(),
+        };
+        
+        println!("GUI: Emitting 'transfer-request' event for ID: {}", request_id);
+        if let Err(e) = self.app.emit("transfer-request", &gui_req) {
+            eprintln!("GUI: Failed to emit event: {}", e);
+        }
+        
+        // 3. Wait for response
+        match rx.await {
+            Ok(accepted) => {
+                println!("GUI: User decision for {}: {}", request_id, if accepted { "ACCEPTED" } else { "REJECTED" });
+                accepted
+            },
+            Err(_) => {
+                println!("GUI: Response channel closed (timeout or error). Rejecting.");
+                false
+            }
+        }
+    }
 }
 
 /// Get pending transfer requests

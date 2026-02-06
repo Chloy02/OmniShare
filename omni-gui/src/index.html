@@ -29,6 +29,43 @@
     </div>
   </div>
 
+  <!-- Transfer Request Modal -->
+  <div id="transfer-modal"
+    class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 hidden z-50 transition-opacity duration-300">
+    <div
+      class="bg-slate-800 rounded-2xl shadow-2xl p-6 max-w-md w-full border border-slate-700 transform transition-all scale-100">
+      <h2 class="text-2xl font-bold mb-4 flex items-center gap-2">
+        <span>📲</span>
+        <span>Incoming Transfer</span>
+      </h2>
+
+      <div class="space-y-4">
+        <div class="bg-slate-900/50 p-4 rounded-xl">
+          <p class="text-sm text-slate-400 mb-1">From</p>
+          <p class="font-medium text-lg text-white" id="modal-sender">Device Name</p>
+        </div>
+
+        <div class="bg-slate-900/50 p-4 rounded-xl max-h-48 overflow-y-auto custom-scrollbar">
+          <p class="text-sm text-slate-400 mb-2">Files</p>
+          <ul class="space-y-2" id="modal-files">
+            <!-- Files injected here -->
+          </ul>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4 mt-8">
+        <button id="modal-reject"
+          class="px-4 py-3 bg-red-500/10 hover:bg-red-500/20 text-red-500 rounded-xl font-bold transition flex justify-center items-center gap-2">
+          Decline
+        </button>
+        <button id="modal-accept"
+          class="px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold shadow-lg shadow-blue-500/20 transition flex justify-center items-center gap-2">
+          Accept
+        </button>
+      </div>
+    </div>
+  </div>
+
   <script src="main.js" type="module"></script>
 </body>
 
