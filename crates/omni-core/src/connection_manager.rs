@@ -1,6 +1,8 @@
 use anyhow::Result;
 use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
+use std::sync::Arc;
+use crate::{TransferDelegate, TransferRequest, FileInfo};
 
 
 pub struct ConnectionManager;
@@ -19,7 +21,7 @@ impl ConnectionManager {
                 // Use default Downloads directory for reverse connections
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 let download_dir = std::path::PathBuf::from(format!("{}/Downloads", home));
-                if let Err(e) = Self::handle_connection(&mut socket, download_dir).await {
+                if let Err(e) = Self::handle_connection(&mut socket, download_dir, None).await {
                     eprintln!("REVERSE: Handshake failed: {}", e);
                 }
                 Ok(())
@@ -32,7 +34,7 @@ impl ConnectionManager {
     }
 
     /// Starts the TCP Listener on Port 5200 (Standard Quick Share Port)
-    pub async fn start_server(download_dir: std::path::PathBuf) -> Result<()> {
+    pub async fn start_server(download_dir: std::path::PathBuf, delegate: Option<Arc<dyn TransferDelegate>>) -> Result<()> {
         let addr = "0.0.0.0:5200";
         let listener = TcpListener::bind(addr).await?;
         println!("TCP Server: Listening for Quick Share connections on {}", addr);
@@ -45,8 +47,9 @@ impl ConnectionManager {
 
             // Spawn a task to handle this connection so we don't block the listener
             let download_dir_clone = download_dir.clone();
+            let delegate_clone = delegate.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(&mut socket, download_dir_clone).await {
+                if let Err(e) = Self::handle_connection(&mut socket, download_dir_clone, delegate_clone).await {
                     eprintln!("TCP Server: Connection error from {}: {}", peer_addr, e);
                 }
             });
@@ -57,9 +60,12 @@ impl ConnectionManager {
     /// 1. Loop to read Frames.
     /// 2. Decode ConnectionRequest.
     /// 3. Decode UKEY2 Client Init.
-    async fn handle_connection(socket: &mut tokio::net::TcpStream, download_dir: std::path::PathBuf) -> Result<()> {
+    /// 2. Decode ConnectionRequest.
+    /// 3. Decode UKEY2 Client Init.
+    async fn handle_connection(socket: &mut tokio::net::TcpStream, download_dir: std::path::PathBuf, delegate: Option<Arc<dyn TransferDelegate>>) -> Result<()> {
         println!("TCP Handler: Handler started.");
         let mut _remote_handshake_data: Option<Vec<u8>> = None;
+        let mut remote_device_name = String::new();
 
         loop {
             // --- Step 1: Read Transmission Length (4 Bytes Big Endian) ---
@@ -97,7 +103,8 @@ impl ConnectionManager {
                     if let Some(req) = v1.connection_request {
                         println!("TCP Handler: 📱 CONNECTION REQUEST DETECTED");
                         // Clean up device name (sometimes has proto artifacts)
-                        let raw_name = req.endpoint_name.unwrap_or_default();
+                        let raw_name = req.endpoint_name.clone().unwrap_or_default();
+                        remote_device_name = raw_name.clone();
                         println!("    -> Name: \"{}\" (Raw: {:?})", raw_name, raw_name.as_bytes());
                         println!("    -> ID: {:?}", req.endpoint_id);
                         
@@ -264,6 +271,9 @@ impl ConnectionManager {
                                                   pke_sharing_frame.encode(&mut pke_buf)?;
                                                   let pke_buf_len = pke_buf.len() as i64;
                                                   
+                                                  // Initialize server sequence number
+                                                  let mut server_seq_num = 1;
+
                                                   // Generate a random payload ID for this transfer
                                                   let payload_id: i64 = rand::random();
                                                   
@@ -303,9 +313,10 @@ impl ConnectionManager {
                                                   
                                                   // Wrap in DeviceToDeviceMessage
                                                   let d2d_msg = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                      sequence_number: Some(1), 
+                                                      sequence_number: Some(server_seq_num), 
                                                       message: Some(offline_buf),
                                                   };
+                                                  server_seq_num += 1;
                                                   let mut d2d_buf = Vec::new();
                                                   d2d_msg.encode(&mut d2d_buf)?;
                                                   
@@ -353,9 +364,10 @@ impl ConnectionManager {
                                                   end_offline_frame.encode(&mut end_buf)?;
                                                   
                                                   let d2d_end = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                      sequence_number: Some(2), 
+                                                      sequence_number: Some(server_seq_num), 
                                                       message: Some(end_buf),
                                                   };
+                                                  server_seq_num += 1;
                                                   let mut d2d_end_buf = Vec::new();
                                                   d2d_end.encode(&mut d2d_end_buf)?;
                                                   
@@ -625,9 +637,10 @@ impl ConnectionManager {
                                                                            pkr_offline.encode(&mut pkr_offline_buf)?;
                                                                            
                                                                            let d2d_pkr = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                               sequence_number: Some(3), 
+                                                                               sequence_number: Some(server_seq_num), 
                                                                                message: Some(pkr_offline_buf),
                                                                            };
+                                                                           server_seq_num += 1;
                                                                            let mut d2d_pkr_buf = Vec::new();
                                                                            d2d_pkr.encode(&mut d2d_pkr_buf)?;
                                                                            
@@ -671,9 +684,10 @@ impl ConnectionManager {
                                                                            pkr_end_offline.encode(&mut pkr_end_buf)?;
                                                                            
                                                                            let d2d_pkr_end = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                               sequence_number: Some(4), 
+                                                                               sequence_number: Some(server_seq_num), 
                                                                                message: Some(pkr_end_buf),
                                                                            };
+                                                                           server_seq_num += 1;
                                                                            let mut d2d_pkr_end_buf = Vec::new();
                                                                            d2d_pkr_end.encode(&mut d2d_pkr_end_buf)?;
                                                                            
@@ -736,10 +750,28 @@ impl ConnectionManager {
                                                                                 println!("╚════════════════════════════════════════════════════╝");
                                                                                 println!();
                                                                                 
-                                                                                // Auto-accept for CLI (blocking stdin breaks the protocol timing)
-                                                                                // TODO: GUI will properly handle accept/reject via channels
-                                                                                println!("✅ Auto-accepting transfer (use GUI for interactive accept/reject)");
-                                                                                let user_accepted = true;
+                                                // Ask delegate for permission
+                                                let user_accepted = if let Some(delegate) = &delegate {
+                                                    println!("TCP Handler: Requesting user confirmation via delegate...");
+                                                    
+                                                    let files: Vec<FileInfo> = intro.file_metadata.iter().map(|f| FileInfo {
+                                                        name: f.name.clone().unwrap_or_default(),
+                                                        size: f.size.unwrap_or(0) as u64,
+                                                        mime_type: f.mime_type.clone().unwrap_or_default(),
+                                                        payload_id: f.payload_id.unwrap_or(0),
+                                                    }).collect();
+                                                    
+                                                    let req = TransferRequest {
+                                                        id: rand::random(),
+                                                        sender_name: remote_device_name.clone(),
+                                                        files,
+                                                    };
+                                                    
+                                                    delegate.on_transfer_request(req).await
+                                                } else {
+                                                    println!("✅ No delegate attached. Auto-accepting transfer.");
+                                                    true
+                                                };
                                                                                 
                                                                                 if !user_accepted {
                                                                                     println!("TCP Handler: ❌ User REJECTED transfer.");
@@ -798,9 +830,10 @@ impl ConnectionManager {
                                                                                     resp_offline.encode(&mut resp_offline_buf)?;
                                                                                     
                                                                                     let d2d_resp = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                        sequence_number: Some(5), 
+                                                                                        sequence_number: Some(server_seq_num), 
                                                                                         message: Some(resp_offline_buf),
                                                                                     };
+                                                                                    server_seq_num += 1;
                                                                                     let mut d2d_resp_buf = Vec::new();
                                                                                     d2d_resp.encode(&mut d2d_resp_buf)?;
                                                                                     
@@ -844,9 +877,10 @@ impl ConnectionManager {
                                                                                     resp_end_offline.encode(&mut resp_end_buf)?;
                                                                                     
                                                                                     let d2d_resp_end = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                        sequence_number: Some(6), 
+                                                                                        sequence_number: Some(server_seq_num), 
                                                                                         message: Some(resp_end_buf),
                                                                                     };
+                                                                                    // server_seq_num += 1; // Unused as we break immediately
                                                                                     let mut d2d_resp_end_buf = Vec::new();
                                                                                     d2d_resp_end.encode(&mut d2d_resp_end_buf)?;
                                                                                     
@@ -916,9 +950,10 @@ impl ConnectionManager {
                                                                                resp_offline.encode(&mut resp_offline_buf)?;
                                                                                
                                                                                let d2d_resp = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                   sequence_number: Some(5), 
+                                                                                   sequence_number: Some(server_seq_num), 
                                                                                    message: Some(resp_offline_buf),
                                                                                };
+                                                                               server_seq_num += 1;
                                                                                let mut d2d_resp_buf = Vec::new();
                                                                                d2d_resp.encode(&mut d2d_resp_buf)?;
                                                                                
@@ -962,9 +997,10 @@ impl ConnectionManager {
                                                                                resp_end_offline.encode(&mut resp_end_buf)?;
                                                                                
                                                                                let d2d_resp_end = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                   sequence_number: Some(6), 
+                                                                                   sequence_number: Some(server_seq_num), 
                                                                                    message: Some(resp_end_buf),
                                                                                };
+                                                                               server_seq_num += 1;
                                                                                let mut d2d_resp_end_buf = Vec::new();
                                                                                d2d_resp_end.encode(&mut d2d_resp_end_buf)?;
                                                                                
@@ -991,9 +1027,10 @@ impl ConnectionManager {
                                                                             ka_frame.encode(&mut ka_buf)?;
                                                                             
                                                                             let d2d_ka = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                sequence_number: Some(999), 
+                                                                                sequence_number: Some(server_seq_num), 
                                                                                 message: Some(ka_buf),
                                                                             };
+                                                                            server_seq_num += 1;
                                                                             let mut ka_enc_buf = Vec::new();
                                                                             d2d_ka.encode(&mut ka_enc_buf)?;
                                                                             
