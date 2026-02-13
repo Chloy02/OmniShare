@@ -12,6 +12,7 @@ type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Clone)]
 pub struct SecurityEngine {
     decrypt_key: [u8; 32],
     encrypt_key: [u8; 32],

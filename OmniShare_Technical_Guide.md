@@ -276,3 +276,28 @@ This architecture ensures privacy (randomized MACs/Salts), security (Forward Sec
 - [ ] **Phase 5: Transfer History**: Persist transfer logs to SQLite.
 - [ ] **Phase 6: Settings**: Allow users to change the default download directory and device name.
 - [ ] **Outbound Transfer**: Re-visit the encryption issues blocking Linux-to-Android transfers.
+
+---
+
+## 9. Running OmniShare
+
+### CLI Mode (Headless)
+
+#### ▶️ Use the default directory (`~/Downloads`)
+```bash
+cargo run -p omni-cli -- run
+```
+
+#### 📂 Use a custom download folder
+```bash
+cargo run -p omni-cli -- run --download-dir /path/to/custom/folder
+# OR
+cargo run -p omni-cli -- run -d /path/to/custom/folder
+```
+
+### GUI Mode (System Tray)
+
+```bash
+cargo tauri dev
+```
+

@@ -1,7 +1,9 @@
 use anyhow::Result;
 use tokio::net::TcpListener;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt}; // AsyncWriteExt needed for writer
+use tokio::sync::mpsc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use crate::{TransferDelegate, TransferRequest, FileInfo};
 
 
@@ -16,12 +18,12 @@ impl ConnectionManager {
         println!("REVERSE: Connecting to phone at {}...", target);
         
         match TcpStream::connect(target).await {
-            Ok(mut socket) => {
+            Ok(socket) => {
                 println!("REVERSE: Connection established! Starting handshake...");
                 // Use default Downloads directory for reverse connections
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 let download_dir = std::path::PathBuf::from(format!("{}/Downloads", home));
-                if let Err(e) = Self::handle_connection(&mut socket, download_dir, None).await {
+                if let Err(e) = Self::handle_connection(socket, download_dir, None).await {
                     eprintln!("REVERSE: Handshake failed: {}", e);
                 }
                 Ok(())
@@ -42,14 +44,14 @@ impl ConnectionManager {
 
         loop {
             // Accept new connection
-            let (mut socket, peer_addr) = listener.accept().await?;
+            let (socket, peer_addr) = listener.accept().await?;
             println!("TCP Server: Incoming connection from {}", peer_addr);
 
             // Spawn a task to handle this connection so we don't block the listener
             let download_dir_clone = download_dir.clone();
             let delegate_clone = delegate.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(&mut socket, download_dir_clone, delegate_clone).await {
+                if let Err(e) = Self::handle_connection(socket, download_dir_clone, delegate_clone).await {
                     eprintln!("TCP Server: Connection error from {}: {}", peer_addr, e);
                 }
             });
@@ -62,7 +64,7 @@ impl ConnectionManager {
     /// 3. Decode UKEY2 Client Init.
     /// 2. Decode ConnectionRequest.
     /// 3. Decode UKEY2 Client Init.
-    async fn handle_connection(socket: &mut tokio::net::TcpStream, download_dir: std::path::PathBuf, delegate: Option<Arc<dyn TransferDelegate>>) -> Result<()> {
+    async fn handle_connection(mut socket: tokio::net::TcpStream, download_dir: std::path::PathBuf, delegate: Option<Arc<dyn TransferDelegate>>) -> Result<()> {
         println!("TCP Handler: Handler started.");
         let mut _remote_handshake_data: Option<Vec<u8>> = None;
         let mut remote_device_name = String::new();
@@ -381,6 +383,93 @@ impl ConnectionManager {
                                                   println!("TCP Handler: Listening for Client's Encrypted Frames...");
                                                   // Read loop for secure messages
                                                   
+                                                  // --- NON-BLOCKING WRITER TASK (KeepAlive Injection) ---
+                                                  println!("TCP Handler: Spawning Writer Task for KeepAlives & Responses...");
+                                                  let (mut socket, mut writer) = socket.into_split();
+                                                  let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+                                                  
+                                                  let engine_clone = engine.clone();
+                                                  let mut writer_seq_num = server_seq_num;
+                                                  
+                                                  tokio::spawn(async move {
+                                                      let mut interval = tokio::time::interval(Duration::from_secs(5));
+                                                      // Align first tick?
+                                                      interval.tick().await; 
+                                                      
+                                                      loop {
+                                                          tokio::select! {
+                                                              msg = rx.recv() => {
+                                                                  match msg {
+                                                                      Some(payload_bytes) => {
+                                                                         // Wrap in DeviceToDevice Message
+                                                                         let d2d = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                             sequence_number: Some(writer_seq_num),
+                                                                             message: Some(payload_bytes),
+                                                                         };
+                                                                         writer_seq_num += 1;
+                                                                         
+                                                                         let mut d2d_buf = Vec::new();
+                                                                         if let Ok(()) = d2d.encode(&mut d2d_buf) {
+                                                                             let gcm_meta = crate::proto::ukey2::GcmMetadata {
+                                                                                  r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
+                                                                                  version: Some(1),
+                                                                             };
+                                                                             let mut meta_bytes = Vec::new();
+                                                                             gcm_meta.encode(&mut meta_bytes).unwrap();
+                                                                             
+                                                                             if let Ok(encrypted) = engine_clone.encrypt_and_sign(&d2d_buf, Some(&meta_bytes)) {
+                                                                                 let len_prefix = (encrypted.len() as u32).to_be_bytes();
+                                                                                 let _ = writer.write_all(&len_prefix).await;
+                                                                                 let _ = writer.write_all(&encrypted).await;
+                                                                             }
+                                                                         }
+                                                                      }
+                                                                      None => break, // Channel closed
+                                                                  }
+                                                              }
+                                                              _ = interval.tick() => {
+                                                                  // SEND KEEP ALIVE
+                                                                  let ka = crate::proto::wire_format::KeepAliveFrame { ack: Some(false) };
+                                                                  let v1 = crate::proto::wire_format::V1Frame {
+                                                                      r#type: Some(crate::proto::wire_format::v1_frame::FrameType::KeepAlive.into()),
+                                                                      keep_alive: Some(ka),
+                                                                      ..Default::default()
+                                                                  };
+                                                                  let frame = crate::proto::wire_format::Frame {
+                                                                      version: Some(crate::proto::wire_format::frame::Version::V1.into()),
+                                                                      v1: Some(v1),
+                                                                  };
+                                                                  let mut ka_buf = Vec::new();
+                                                                  frame.encode(&mut ka_buf).unwrap();
+                                                                  
+                                                                  // Wrap in D2D
+                                                                   let d2d = crate::proto::ukey2::DeviceToDeviceMessage {
+                                                                       sequence_number: Some(writer_seq_num),
+                                                                       message: Some(ka_buf),
+                                                                   };
+                                                                   writer_seq_num += 1;
+                                                                   
+                                                                   let mut d2d_buf = Vec::new();
+                                                                   d2d.encode(&mut d2d_buf).unwrap();
+                                                                   
+                                                                   let gcm_meta = crate::proto::ukey2::GcmMetadata {
+                                                                        r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
+                                                                        version: Some(1),
+                                                                   };
+                                                                   let mut meta_bytes = Vec::new();
+                                                                   gcm_meta.encode(&mut meta_bytes).unwrap();
+                                                                   
+                                                                   if let Ok(encrypted) = engine_clone.encrypt_and_sign(&d2d_buf, Some(&meta_bytes)) {
+                                                                       let len_prefix = (encrypted.len() as u32).to_be_bytes();
+                                                                       let _ = writer.write_all(&len_prefix).await;
+                                                                       let _ = writer.write_all(&encrypted).await;
+                                                                       println!("TCP Handler: Sent KeepAlive (seq={})", writer_seq_num - 1);
+                                                                   }
+                                                              }
+                                                          }
+                                                      }
+                                                  });
+                                                  
                                                   // File transfer state tracking
                                                   use std::collections::HashMap;
                                                   
@@ -388,6 +477,7 @@ impl ConnectionManager {
                                                   let mut file_metadata_map: HashMap<i64, (String, i64)> = HashMap::new();
                                                   // Maps payload_id -> accumulated bytes
                                                   let mut file_buffers: HashMap<i64, Vec<u8>> = HashMap::new();
+                                                  let mut last_progress_update: HashMap<i64, Instant> = HashMap::new();
                                                   
                                                   loop {
                                                       let mut length_buf = [0u8; 4];
@@ -473,8 +563,56 @@ impl ConnectionManager {
                                                                                                                     
                                                                                                                     if is_file_type {
                                                                                                                         // Add to buffer
-                                                                                                                        let buffer = file_buffers.entry(payload_id).or_insert_with(Vec::new);
+                                                                                                                        let buffer = file_buffers.entry(payload_id).or_insert_with(|| {
+                                                                                                                             let initial_cap = file_metadata_map.get(&payload_id)
+                                                                                                                                 .map(|(_, size)| *size as usize)
+                                                                                                                                 .unwrap_or(1024 * 1024); // Default 1MB
+                                                                                                                             Vec::with_capacity(initial_cap)
+                                                                                                                         });
                                                                                                                         buffer.extend_from_slice(&body);
+                                                                                                                        let current_len = buffer.len() as u64;
+
+                                                                                        // --- Progress Reporting (Throttled) ---
+                                                                                        let is_last_chunk_preview = chunk.flags == Some(1);
+                                                                                        if let Some((_, total_size)) = file_metadata_map.get(&payload_id) {
+                                                                                            let now = Instant::now();
+                                                                                            let should_update = is_last_chunk_preview || match last_progress_update.get(&payload_id) {
+                                                                                                Some(last) => now.duration_since(*last) >= std::time::Duration::from_millis(100),
+                                                                                                None => true,
+                                                                                            };
+
+                                                                                            if should_update {
+                                                                                                if let Some(delegate) = &delegate {
+                                                                                                    // NON-BLOCKING: Spawn progress update to avoid stalling the TCP loop
+                                                                                                    let delegate = delegate.clone();
+                                                                                                    let total_len = *total_size as u64;
+                                                                                                    tokio::spawn(async move {
+                                                                                                        delegate.on_transfer_progress(payload_id, current_len, total_len).await;
+                                                                                                    });
+                                                                                                }
+                                                                                                last_progress_update.insert(payload_id, now);
+                                                                                            }
+                                                                                        }
+                                                                                        // -------------------------------------
+
+
+                                                                                        // --- Progress Reporting (Throttled) ---
+                                                                                        let is_last_chunk_preview = chunk.flags == Some(1);
+                                                                                        if let Some((_, total_size)) = file_metadata_map.get(&payload_id) {
+                                                                                            let now = Instant::now();
+                                                                                            let should_update = is_last_chunk_preview || match last_progress_update.get(&payload_id) {
+                                                                                                Some(last) => now.duration_since(*last) >= std::time::Duration::from_millis(100),
+                                                                                                None => true,
+                                                                                            };
+
+                                                                                            if should_update {
+                                                                                                if let Some(delegate) = &delegate {
+                                                                                                    delegate.on_transfer_progress(payload_id, current_len, *total_size as u64).await;
+                                                                                                }
+                                                                                                last_progress_update.insert(payload_id, now);
+                                                                                            }
+                                                                                        }
+                                                                                        // -------------------------------------
                                                                                                                         println!("TCP Handler: 📥 Buffered {} bytes for payload_id: {} (Total: {} bytes)", 
                                                                                                                             body.len(), payload_id, buffer.len());
                                                                                                                         
@@ -635,27 +773,11 @@ impl ConnectionManager {
                                                                            
                                                                            let mut pkr_offline_buf = Vec::new();
                                                                            pkr_offline.encode(&mut pkr_offline_buf)?;
-                                                                           
-                                                                           let d2d_pkr = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                               sequence_number: Some(server_seq_num), 
-                                                                               message: Some(pkr_offline_buf),
-                                                                           };
-                                                                           server_seq_num += 1;
-                                                                           let mut d2d_pkr_buf = Vec::new();
-                                                                           d2d_pkr.encode(&mut d2d_pkr_buf)?;
-                                                                           
-                                                                           let gcm_meta = crate::proto::ukey2::GcmMetadata {
-                                                                               r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
-                                                                               version: Some(1),
-                                                                           };
-                                                                           let mut meta_bytes = Vec::new();
-                                                                           gcm_meta.encode(&mut meta_bytes)?;
-                                                                           
-                                                                           let encrypted_pkr = engine.encrypt_and_sign(&d2d_pkr_buf, Some(&meta_bytes))?;
-                                                                           let len_prefix = (encrypted_pkr.len() as u32).to_be_bytes();
-                                                                           socket.write_all(&len_prefix).await?;
-                                                                           socket.write_all(&encrypted_pkr).await?;
-                                                                           println!("TCP Handler: Sent PKR in PayloadTransfer (data frame)!");
+                                                                                        // REFACTORED: Send internal OfflineFrame bytes to Writer Task
+                                                                            if let Err(e) = tx.send(pkr_offline_buf).await {
+                                                                                eprintln!("TCP Handler: Failed to send PKR to writer: {}", e);
+                                                                            }
+                                                                            println!("TCP Handler: Queued PKR for sending.");
                                                                            
                                                                            // Send END marker
                                                                            let pkr_end_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
@@ -682,20 +804,11 @@ impl ConnectionManager {
                                                                            
                                                                            let mut pkr_end_buf = Vec::new();
                                                                            pkr_end_offline.encode(&mut pkr_end_buf)?;
-                                                                           
-                                                                           let d2d_pkr_end = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                               sequence_number: Some(server_seq_num), 
-                                                                               message: Some(pkr_end_buf),
-                                                                           };
-                                                                           server_seq_num += 1;
-                                                                           let mut d2d_pkr_end_buf = Vec::new();
-                                                                           d2d_pkr_end.encode(&mut d2d_pkr_end_buf)?;
-                                                                           
-                                                                           let encrypted_pkr_end = engine.encrypt_and_sign(&d2d_pkr_end_buf, Some(&meta_bytes))?;
-                                                                           let end_len_prefix = (encrypted_pkr_end.len() as u32).to_be_bytes();
-                                                                           socket.write_all(&end_len_prefix).await?;
-                                                                           socket.write_all(&encrypted_pkr_end).await?;
-                                                                           println!("TCP Handler: Sent PKR END marker!");
+                                                                                        // REFACTORED: Send internal OfflineFrame bytes to Writer Task
+                                                                            if let Err(e) = tx.send(pkr_end_buf).await {
+                                                                                eprintln!("TCP Handler: Failed to send PKR END to writer: {}", e);
+                                                                            }
+                                                                            println!("TCP Handler: Queued PKR END marker for sending.");
 
                                                                       } else if frame_type == 4 { // PAIRED_KEY_RESULT
                                                                            println!("TCP Handler: 🔑 Client's PAIRED_KEY_RESULT received!");
@@ -762,7 +875,7 @@ impl ConnectionManager {
                                                     }).collect();
                                                     
                                                     let req = TransferRequest {
-                                                        id: rand::random(),
+                                                        id: files.first().map(|f| f.payload_id).unwrap_or_else(|| rand::random()),
                                                         sender_name: remote_device_name.clone(),
                                                         files,
                                                     };
@@ -829,26 +942,11 @@ impl ConnectionManager {
                                                                                     let mut resp_offline_buf = Vec::new();
                                                                                     resp_offline.encode(&mut resp_offline_buf)?;
                                                                                     
-                                                                                    let d2d_resp = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                        sequence_number: Some(server_seq_num), 
-                                                                                        message: Some(resp_offline_buf),
-                                                                                    };
-                                                                                    server_seq_num += 1;
-                                                                                    let mut d2d_resp_buf = Vec::new();
-                                                                                    d2d_resp.encode(&mut d2d_resp_buf)?;
-                                                                                    
-                                                                                    let gcm_meta = crate::proto::ukey2::GcmMetadata {
-                                                                                        r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
-                                                                                        version: Some(1),
-                                                                                    };
-                                                                                    let mut meta_bytes = Vec::new();
-                                                                                    gcm_meta.encode(&mut meta_bytes)?;
-                                                                                    
-                                                                                    let encrypted_resp = engine.encrypt_and_sign(&d2d_resp_buf, Some(&meta_bytes))?;
-                                                                                    let len_prefix = (encrypted_resp.len() as u32).to_be_bytes();
-                                                                                    socket.write_all(&len_prefix).await?;
-                                                                                    socket.write_all(&encrypted_resp).await?;
-                                                                                    println!("TCP Handler: Sent RESPONSE (REJECT)!");
+                                                                                    // REFACTORED: Send internal OfflineFrame bytes to Writer Task
+                                                                                    if let Err(e) = tx.send(resp_offline_buf).await {
+                                                                                        eprintln!("TCP Handler: Failed to send REJECT to writer: {}", e);
+                                                                                    }
+                                                                                    println!("TCP Handler: Queued RESPONSE (REJECT)!");
                                                                                     
                                                                                     // Send END marker
                                                                                     let resp_end_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
@@ -876,19 +974,11 @@ impl ConnectionManager {
                                                                                     let mut resp_end_buf = Vec::new();
                                                                                     resp_end_offline.encode(&mut resp_end_buf)?;
                                                                                     
-                                                                                    let d2d_resp_end = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                        sequence_number: Some(server_seq_num), 
-                                                                                        message: Some(resp_end_buf),
-                                                                                    };
-                                                                                    // server_seq_num += 1; // Unused as we break immediately
-                                                                                    let mut d2d_resp_end_buf = Vec::new();
-                                                                                    d2d_resp_end.encode(&mut d2d_resp_end_buf)?;
-                                                                                    
-                                                                                    let encrypted_resp_end = engine.encrypt_and_sign(&d2d_resp_end_buf, Some(&meta_bytes))?;
-                                                                                    let end_len_prefix = (encrypted_resp_end.len() as u32).to_be_bytes();
-                                                                                    socket.write_all(&end_len_prefix).await?;
-                                                                                    socket.write_all(&encrypted_resp_end).await?;
-                                                                                    println!("TCP Handler: Sent REJECT END marker!");
+                                                                                    // REFACTORED: Send internal OfflineFrame bytes to Writer Task
+                                                                                    if let Err(e) = tx.send(resp_end_buf).await {
+                                                                                        eprintln!("TCP Handler: Failed to send REJECT END to writer: {}", e);
+                                                                                    }
+                                                                                    println!("TCP Handler: Queued REJECT END marker!");
                                                                                     
                                                                                     // Exit the loop - transfer rejected
                                                                                     break;
@@ -949,26 +1039,11 @@ impl ConnectionManager {
                                                                                let mut resp_offline_buf = Vec::new();
                                                                                resp_offline.encode(&mut resp_offline_buf)?;
                                                                                
-                                                                               let d2d_resp = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                   sequence_number: Some(server_seq_num), 
-                                                                                   message: Some(resp_offline_buf),
-                                                                               };
-                                                                               server_seq_num += 1;
-                                                                               let mut d2d_resp_buf = Vec::new();
-                                                                               d2d_resp.encode(&mut d2d_resp_buf)?;
-                                                                               
-                                                                               let gcm_meta = crate::proto::ukey2::GcmMetadata {
-                                                                                   r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
-                                                                                   version: Some(1),
-                                                                               };
-                                                                               let mut meta_bytes = Vec::new();
-                                                                               gcm_meta.encode(&mut meta_bytes)?;
-                                                                               
-                                                                               let encrypted_resp = engine.encrypt_and_sign(&d2d_resp_buf, Some(&meta_bytes))?;
-                                                                               let len_prefix = (encrypted_resp.len() as u32).to_be_bytes();
-                                                                               socket.write_all(&len_prefix).await?;
-                                                                               socket.write_all(&encrypted_resp).await?;
-                                                                               println!("TCP Handler: Sent RESPONSE (ACCEPT) in PayloadTransfer!");
+                                                                               // REFACTORED: Send internal OfflineFrame bytes to Writer Task
+                                                                               if let Err(e) = tx.send(resp_offline_buf).await {
+                                                                                   eprintln!("TCP Handler: Failed to send ACCEPT to writer: {}", e);
+                                                                               }
+                                                                               println!("TCP Handler: Queued RESPONSE (ACCEPT)!");
                                                                                
                                                                                // Send END marker
                                                                                let resp_end_chunk = crate::proto::quick_share::payload_transfer::PayloadChunk {
@@ -996,19 +1071,11 @@ impl ConnectionManager {
                                                                                let mut resp_end_buf = Vec::new();
                                                                                resp_end_offline.encode(&mut resp_end_buf)?;
                                                                                
-                                                                               let d2d_resp_end = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                   sequence_number: Some(server_seq_num), 
-                                                                                   message: Some(resp_end_buf),
-                                                                               };
-                                                                               server_seq_num += 1;
-                                                                               let mut d2d_resp_end_buf = Vec::new();
-                                                                               d2d_resp_end.encode(&mut d2d_resp_end_buf)?;
-                                                                               
-                                                                               let encrypted_resp_end = engine.encrypt_and_sign(&d2d_resp_end_buf, Some(&meta_bytes))?;
-                                                                               let end_len_prefix = (encrypted_resp_end.len() as u32).to_be_bytes();
-                                                                               socket.write_all(&end_len_prefix).await?;
-                                                                               socket.write_all(&encrypted_resp_end).await?;
-                                                                               println!("TCP Handler: Sent RESPONSE END marker!");
+                                                                               // REFACTORED: Send internal OfflineFrame bytes to Writer Task
+                                                                               if let Err(e) = tx.send(resp_end_buf).await {
+                                                                                   eprintln!("TCP Handler: Failed to send ACCEPT END to writer: {}", e);
+                                                                               }
+                                                                               println!("TCP Handler: Queued RESPONSE END marker!");
                                                                            }
                                                                       } else if frame_type == 12 { // KEEP_ALIVE
                                                                            println!("TCP Handler: 💓 Received KEEP_ALIVE, responding with ack...");
@@ -1026,26 +1093,11 @@ impl ConnectionManager {
                                                                             let mut ka_buf = Vec::new();
                                                                             ka_frame.encode(&mut ka_buf)?;
                                                                             
-                                                                            let d2d_ka = crate::proto::ukey2::DeviceToDeviceMessage {
-                                                                                sequence_number: Some(server_seq_num), 
-                                                                                message: Some(ka_buf),
-                                                                            };
-                                                                            server_seq_num += 1;
-                                                                            let mut ka_enc_buf = Vec::new();
-                                                                            d2d_ka.encode(&mut ka_enc_buf)?;
-                                                                            
-                                                                            let gcm_meta = crate::proto::ukey2::GcmMetadata {
-                                                                                r#type: crate::proto::ukey2::Type::DeviceToDeviceMessage.into(),
-                                                                                 version: Some(1),
-                                                                             };
-                                                                             let mut meta_bytes = Vec::new();
-                                                                             gcm_meta.encode(&mut meta_bytes)?;
-
-                                                                             let encrypted_ka = engine.encrypt_and_sign(&ka_enc_buf, Some(&meta_bytes))?;
-                                                                             let len_prefix = (encrypted_ka.len() as u32).to_be_bytes();
-                                                                             socket.write_all(&len_prefix).await?;
-                                                                             socket.write_all(&encrypted_ka).await?;
-                                                                             println!("TCP Handler: Sent KEEP_ALIVE Ack.");
+                                                                            // REFACTORED: Send internal OfflineFrame/SafeMessage bytes to Writer Task
+                                                                            if let Err(e) = tx.send(ka_buf).await {
+                                                                                eprintln!("TCP Handler: Failed to send KeepAlive Ack to writer: {}", e);
+                                                                            }
+                                                                            println!("TCP Handler: Queued KEEP_ALIVE Ack.");
                                                                       } else if frame_type == 2 { // RESPONSE (ConnectionResponseFrame)
                                                                            println!("TCP Handler: 📬 Client's RESPONSE received!");
                                                                            if let Some(conn_resp) = &v1.connection_response {
@@ -1088,6 +1140,8 @@ impl ConnectionManager {
                                                           }
                                                       }
                                                   }
+                                                  // Secure loop finished (connection closed), so we exit the handler.
+                                                  return Ok(());
                                               }
                                          }
                                     },

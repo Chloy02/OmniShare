@@ -38,7 +38,7 @@ impl Default for Config {
 #[derive(Debug, Clone)]
 pub struct TransferRequest {
     /// Unique identifier for this transfer
-    pub id: u64,
+    pub id: i64,
     /// Name of the sending device
     pub sender_name: String,
     /// Files being transferred
@@ -66,6 +66,10 @@ pub trait TransferDelegate: Send + Sync {
     /// Called when an incoming file transfer request is received (Introduction Level).
     /// Returns `true` to accept the transfer, `false` to reject it.
     async fn on_transfer_request(&self, request: TransferRequest) -> bool;
+
+    /// Called periodically during file transfer to report progress.
+    /// `payload_id` matches the ID from the FileInfo in TransferRequest.
+    async fn on_transfer_progress(&self, payload_id: i64, current_bytes: u64, total_bytes: u64);
 }
 
 /// Generate a random endpoint ID for device identification

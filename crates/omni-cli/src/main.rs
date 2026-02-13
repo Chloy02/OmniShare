@@ -8,6 +8,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::path::PathBuf;
 use std::time::Duration;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::sync::Mutex;
+use std::collections::HashMap;
 
 #[derive(Parser)]
 #[command(name = "omnishare")]
@@ -72,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
                 discovery::ble_native::run_forever(endpoint_id_clone),
                 
                 // TCP Server with custom download directory
-                ConnectionManager::start_server(download_path, Some(Arc::new(ConsoleDelegate)))
+                ConnectionManager::start_server(download_path, Some(Arc::new(ConsoleDelegate::new())))
             );
         },
         Commands::Send { file } => {
@@ -125,7 +128,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct ConsoleDelegate;
+struct ConsoleDelegate {
+    multi: MultiProgress,
+    bars: Mutex<HashMap<i64, ProgressBar>>,
+}
+
+impl ConsoleDelegate {
+    fn new() -> Self {
+        Self {
+            multi: MultiProgress::new(),
+            bars: Mutex::new(HashMap::new()),
+        }
+    }
+}
 
 #[async_trait]
 impl TransferDelegate for ConsoleDelegate {
@@ -141,5 +156,28 @@ impl TransferDelegate for ConsoleDelegate {
         println!("╚════════════════════════════════════════════════════╝");
         println!("✅ Auto-accepting (CLI mode)");
         true
+    }
+
+    async fn on_transfer_progress(&self, payload_id: i64, current_bytes: u64, total_bytes: u64) {
+        let mut bars = self.bars.lock().expect("Failed to lock progress bars");
+        
+        let bar = bars.entry(payload_id).or_insert_with(|| {
+            let pb = self.multi.add(ProgressBar::new(total_bytes));
+            pb.set_style(ProgressStyle::default_bar()
+
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"));
+            pb.set_message(format!("File {}", payload_id));
+            pb
+        });
+
+        bar.set_position(current_bytes);
+
+        if current_bytes >= total_bytes && total_bytes > 0 {
+            bar.finish_with_message("Done");
+            // Remove from map to clean up? For now, we leave it to show "Done".
+            // If we remove it, we can't update it to "Done" effectively if called again.
+        }
     }
 }

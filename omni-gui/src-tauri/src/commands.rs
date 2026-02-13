@@ -76,7 +76,7 @@ pub struct AppState {
     pub pending_transfers: Vec<TransferRequest>,
     pub transfer_history: Vec<TransferRecord>,
     pub service_abort_handle: Option<tokio::task::AbortHandle>,
-    pub transfer_confirmations: HashMap<u64, tokio::sync::oneshot::Sender<bool>>,
+    pub transfer_confirmations: HashMap<i64, tokio::sync::oneshot::Sender<bool>>,
 }
 
 impl Default for AppState {
@@ -182,15 +182,15 @@ pub async fn accept_transfer(
 ) -> Result<String, String> {
     let mut app_state = state.lock().await;
     
-    // Convert string ID back to u64
-    if let Ok(id) = transfer_id.parse::<u64>() {
+    // Convert string ID back to i64
+    if let Ok(id) = transfer_id.parse::<i64>() {
         if let Some(sender) = app_state.transfer_confirmations.remove(&id) {
             let _ = sender.send(true);
             return Ok(format!("Transfer {} accepted", transfer_id));
         }
     }
     
-    Err("Transfer request not found".to_string())
+    Err("Transfer request not found or invalid ID".to_string())
 }
 
 /// Reject a pending transfer
@@ -201,15 +201,15 @@ pub async fn reject_transfer(
 ) -> Result<String, String> {
     let mut app_state = state.lock().await;
     
-    // Convert string ID back to u64
-    if let Ok(id) = transfer_id.parse::<u64>() {
+    // Convert string ID back to i64
+    if let Ok(id) = transfer_id.parse::<i64>() {
         if let Some(sender) = app_state.transfer_confirmations.remove(&id) {
             let _ = sender.send(false);
             return Ok(format!("Transfer {} rejected", transfer_id));
         }
     }
     
-    Err("Transfer request not found".to_string())
+    Err("Transfer request not found or invalid ID".to_string())
 }
 
 struct TauriTransferDelegate {
@@ -221,7 +221,7 @@ struct TauriTransferDelegate {
 impl TransferDelegate for TauriTransferDelegate {
     async fn on_transfer_request(&self, request: omni_core::TransferRequest) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let request_id = request.id;
+        let request_id = request.id; // request.id is already i64
         
         // 1. Store the channel sender
         {
@@ -238,7 +238,7 @@ impl TransferDelegate for TauriTransferDelegate {
         }).collect();
         
         let gui_req = TransferRequest {
-            id: request.id.to_string(), // Convert u64 to String for JS
+            id: request.id.to_string(), // Convert i64 to String for JS
             sender_name: request.sender_name,
             files: gui_files,
             total_size: request.files.iter().map(|f| f.size).sum(),
@@ -259,6 +259,29 @@ impl TransferDelegate for TauriTransferDelegate {
                 println!("GUI: Response channel closed (timeout or error). Rejecting.");
                 false
             }
+        }
+    }
+
+    async fn on_transfer_progress(&self, payload_id: i64, current_bytes: u64, total_bytes: u64) {
+        let percentage = if total_bytes > 0 {
+            (current_bytes as f32 / total_bytes as f32) * 100.0
+        } else {
+            0.0
+        };
+
+        let progress = TransferProgress {
+            id: payload_id.to_string(),
+            progress: percentage,
+            bytes_transferred: current_bytes,
+            total_bytes,
+            speed_bps: 0, 
+        };
+
+        println!("GUI: Emitting progress {}% for ID {} (Transferred: {}/{})", 
+            percentage, payload_id, current_bytes, total_bytes);
+
+        if let Err(e) = self.app.emit("transfer-progress", &progress) {
+            eprintln!("GUI: Failed to emit progress event: {}", e);
         }
     }
 }

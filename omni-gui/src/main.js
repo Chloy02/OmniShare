@@ -70,6 +70,62 @@ async function setupListeners() {
 
     // Show Modal
     document.getElementById('transfer-modal').classList.remove('hidden');
+    // Reset Progress UI
+    document.getElementById('progress-container').classList.add('hidden');
+    document.getElementById('modal-actions').classList.remove('hidden');
+  });
+
+  // Listen for Progress Updates
+  await listen('transfer-progress', (event) => {
+    const p = event.payload;
+    console.log(`EVENT: Received progress for ID ${p.id} (${p.progress.toFixed(1)}%)`, p);
+
+    if (currentTransferId) {
+      console.log(`UI: Current ID ${currentTransferId} (type: ${typeof currentTransferId}) vs Received ID ${p.id} (type: ${typeof p.id})`);
+    } else {
+      console.log("UI: No current transfer ID active.");
+    }
+
+    // Only show progress for current active transfer
+    if (currentTransferId && p.id === currentTransferId) {
+      const container = document.getElementById('progress-container');
+      const actions = document.getElementById('modal-actions');
+
+      if (container.classList.contains('hidden')) {
+        container.classList.remove('hidden');
+        actions.classList.add('hidden'); // Hide buttons during transfer
+      }
+
+      // Update Bar Width
+      const bar = document.getElementById('progress-bar');
+      bar.style.width = `${p.progress}%`;
+
+      // Update Text
+      document.getElementById('progress-percent').textContent = `${p.progress.toFixed(1)}%`;
+      document.getElementById('progress-transferred').textContent =
+        `${formatBytes(p.bytes_transferred)} / ${formatBytes(p.total_bytes)}`;
+
+      // Completion State
+      if (p.progress >= 100) {
+        console.log("UI: Transfer complete. Resetting modal.");
+        document.getElementById('progress-status').textContent = "Transfer Complete!";
+        document.getElementById('progress-status').classList.add('text-green-400');
+        bar.classList.add('bg-green-500');
+
+        // Close modal after delay
+        setTimeout(() => {
+          closeModal();
+          // Reset UI for next time
+          bar.classList.remove('bg-green-500');
+          document.getElementById('progress-status').classList.remove('text-green-400');
+          document.getElementById('progress-status').textContent = "Receiving...";
+        }, 3000);
+      }
+    } else {
+      if (p.id !== currentTransferId) {
+        console.warn(`UI: Ignored progress event. ID mismatch. Expected ${currentTransferId}, got ${p.id}`);
+      }
+    }
   });
 }
 
@@ -91,7 +147,9 @@ window.addEventListener("DOMContentLoaded", () => {
     if (currentTransferId) {
       try {
         await invoke("accept_transfer", { transferId: currentTransferId });
-        closeModal();
+        // Don't close modal! Show progress instead.
+        document.getElementById('modal-actions').classList.add('hidden');
+        document.getElementById('progress-container').classList.remove('hidden');
       } catch (e) {
         console.error("Accept failed:", e);
         alert("Failed to accept: " + e);
