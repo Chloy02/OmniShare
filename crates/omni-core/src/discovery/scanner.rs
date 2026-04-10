@@ -52,14 +52,28 @@ pub async fn discover_devices(timeout: Duration) -> Result<Vec<DiscoveredDevice>
         })).await {
             Ok(Ok(Ok(event))) => {
                 if let ServiceEvent::ServiceResolved(info) = event {
-                    // Only use IPv4 addresses (like rquickshare does)
-                    let ipv4_addrs: Vec<_> = info.get_addresses_v4().iter().cloned().collect();
+                    // Try to get IP from TXT record first (more reliable for Quick Share)
+                    let ip = if let Some(ipv4_txt) = info.get_property_val_str("IPv4") {
+                        // Parse IP from TXT record
+                        if let Ok(parsed_ip) = ipv4_txt.parse::<std::net::Ipv4Addr>() {
+                            parsed_ip
+                        } else {
+                            // Fallback to mDNS addresses
+                            let ipv4_addrs: Vec<_> = info.get_addresses_v4().iter().cloned().collect();
+                            if ipv4_addrs.is_empty() {
+                                continue;
+                            }
+                            *ipv4_addrs[0]
+                        }
+                    } else {
+                        // Fallback to mDNS addresses
+                        let ipv4_addrs: Vec<_> = info.get_addresses_v4().iter().cloned().collect();
+                        if ipv4_addrs.is_empty() {
+                            continue;
+                        }
+                        *ipv4_addrs[0]
+                    };
                     
-                    if ipv4_addrs.is_empty() {
-                        continue;
-                    }
-                    
-                    let ip = ipv4_addrs[0];
                     let port = info.get_port();
                     let ip_port = format!("{}:{}", ip, port);
                     
@@ -68,36 +82,26 @@ pub async fn discover_devices(timeout: Duration) -> Result<Vec<DiscoveredDevice>
                         continue;
                     }
                     
-                    // Verify TCP connectivity (like rquickshare does)
-                    // This ensures the port is actually open and accepting connections
-                    match tokio::time::timeout(
-                        Duration::from_millis(500),
-                        tokio::net::TcpStream::connect(&ip_port)
-                    ).await {
-                        Ok(Ok(_stream)) => {
-                            // Connection successful - device is reachable
-                            let device_name = parse_device_name(info.get_property_val_str("n"));
-                            let endpoint_id = parse_endpoint_id(info.get_fullname());
-                            
-                            let device = DiscoveredDevice {
-                                name: device_name,
-                                endpoint_id: endpoint_id.clone(),
-                                ip: IpAddr::V4(*ip),
-                                port,
-                                fullname: info.get_fullname().to_string(),
-                            };
-                            
-                            println!("📱 Found: {} ({})", device.name, ip_port);
-                            devices.insert(ip_port, device);
-                        }
-                        _ => {
-                            // Connection failed or timed out - skip this device
-                            // Port might not be open yet, or device is not ready
-                        }
-                    }
+                    // NOTE: We do NOT verify TCP connectivity here because Android Quick Share
+                    // only opens the TCP port when a transfer is actually initiated.
+                    // The device advertising on mDNS is sufficient to consider it available.
+                    
+                    let device_name = parse_device_name(info.get_property_val_str("n"));
+                    let endpoint_id = parse_endpoint_id(info.get_fullname());
+                    
+                    let device = DiscoveredDevice {
+                        name: device_name.clone(),
+                        endpoint_id: endpoint_id.clone(),
+                        ip: IpAddr::V4(ip),
+                        port,
+                        fullname: info.get_fullname().to_string(),
+                    };
+                    
+                    println!("📱 Found: {} ({})", device.name, ip_port);
+                    devices.insert(ip_port, device);
                 }
             }
-            _ => {} // Timeout or error, continue scanning
+            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {} // Timeout or error, continue scanning
         }
     }
     

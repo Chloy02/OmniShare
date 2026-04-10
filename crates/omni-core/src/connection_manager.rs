@@ -1,6 +1,6 @@
 use anyhow::Result;
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt}; // AsyncWriteExt needed for writer
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -202,12 +202,12 @@ impl ConnectionManager {
                                                   socket.write_all(&resp_buf).await?;
                                                   println!("TCP Handler: Sent ConnectionResponse! Switching to Encrypted Mode.");
 
-                                                  let engine = crate::security::engine::SecurityEngine::new(
-                                                      &keys.decrypt_key,
-                                                      &keys.encrypt_key,
-                                                      &keys.receive_hmac_key,
-                                                      &keys.send_hmac_key,
+                                                  // Initialize SecurityEngine with SERVER role for inbound transfers
+                                                  let engine = crate::security::engine::SecurityEngine::new_with_role(
+                                                      crate::security::Role::Server,
+                                                      &keys,
                                                   );
+                                                  println!("TCP Handler: 🔑 SecurityEngine initialized with ROLE::SERVER");
                                                   
                                                   // --- Step 4.5: Receive Client's Connection Response (Plaintext) ---
                                                   println!("TCP Handler: Waiting for Client's Plaintext ConnectionResponse...");
@@ -572,7 +572,7 @@ impl ConnectionManager {
                                                                                                                         buffer.extend_from_slice(&body);
                                                                                                                         let current_len = buffer.len() as u64;
 
-                                                                                        // --- Progress Reporting (Throttled) ---
+                                                                                        // --- Progress Reporting (Throttled, Non-Blocking) ---
                                                                                         let is_last_chunk_preview = chunk.flags == Some(1);
                                                                                         if let Some((_, total_size)) = file_metadata_map.get(&payload_id) {
                                                                                             let now = Instant::now();
@@ -583,7 +583,7 @@ impl ConnectionManager {
 
                                                                                             if should_update {
                                                                                                 if let Some(delegate) = &delegate {
-                                                                                                    // NON-BLOCKING: Spawn progress update to avoid stalling the TCP loop
+                                                                                                    // NON-BLOCKING: spawn to avoid stalling TCP receive loop
                                                                                                     let delegate = delegate.clone();
                                                                                                     let total_len = *total_size as u64;
                                                                                                     tokio::spawn(async move {
@@ -593,26 +593,7 @@ impl ConnectionManager {
                                                                                                 last_progress_update.insert(payload_id, now);
                                                                                             }
                                                                                         }
-                                                                                        // -------------------------------------
-
-
-                                                                                        // --- Progress Reporting (Throttled) ---
-                                                                                        let is_last_chunk_preview = chunk.flags == Some(1);
-                                                                                        if let Some((_, total_size)) = file_metadata_map.get(&payload_id) {
-                                                                                            let now = Instant::now();
-                                                                                            let should_update = is_last_chunk_preview || match last_progress_update.get(&payload_id) {
-                                                                                                Some(last) => now.duration_since(*last) >= std::time::Duration::from_millis(100),
-                                                                                                None => true,
-                                                                                            };
-
-                                                                                            if should_update {
-                                                                                                if let Some(delegate) = &delegate {
-                                                                                                    delegate.on_transfer_progress(payload_id, current_len, *total_size as u64).await;
-                                                                                                }
-                                                                                                last_progress_update.insert(payload_id, now);
-                                                                                            }
-                                                                                        }
-                                                                                        // -------------------------------------
+                                                                                        // -----------------------------------------------------
                                                                                                                         println!("TCP Handler: 📥 Buffered {} bytes for payload_id: {} (Total: {} bytes)", 
                                                                                                                             body.len(), payload_id, buffer.len());
                                                                                                                         

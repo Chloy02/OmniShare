@@ -47,6 +47,64 @@ impl SecurityEngine {
         }
     }
 
+    /// Initialize with role-aware key assignment using Ukey2SessionKeys
+    /// 
+    /// # Arguments
+    /// * `role` - Whether we're acting as Client (initiating) or Server (receiving)
+    /// * `session_keys` - Complete key set from UKEY2 handshake
+    ///
+    /// # Key Assignment Logic
+    /// - **Server role** (inbound): Uses d2d_client/server keys for decryption/encryption
+    /// - **Client role** (outbound): Uses derived encrypt_key/decrypt_key directly from session
+    pub fn new_with_role(
+        role: crate::security::Role,
+        session_keys: &super::ukey2::Ukey2SessionKeys,
+    ) -> Self {
+        match role {
+            crate::security::Role::Server => {
+                // Inbound mode (Android → Linux) - WORKING, DO NOT CHANGE
+                // Uses raw D2D keys with specific assignment
+                let mut ck = [0u8; 32]; ck.copy_from_slice(&session_keys.d2d_client_key);
+                let mut sk = [0u8; 32]; sk.copy_from_slice(&session_keys.d2d_server_key);
+                let mut rhk = [0u8; 32]; rhk.copy_from_slice(&session_keys.receive_hmac_key);
+                let mut shk = [0u8; 32]; shk.copy_from_slice(&session_keys.send_hmac_key);
+                
+                Self {
+                    decrypt_key: ck,  // Decrypt with client key
+                    encrypt_key: sk,  // Encrypt with server key
+                    receive_hmac_key: rhk,
+                    send_hmac_key: shk,
+                }
+            }
+            crate::security::Role::Client => {
+                // Outbound mode (Linux → Android)
+                // CRITICAL: Mirror SERVER role — use RAW D2D keys for AES encryption.
+                // The inbound SERVER role works by using d2d_client_key directly for AES.
+                // Android does NOT apply the sm_salt/"ENC:2" derivation layer on top of d2d keys.
+                // In outbound mode WE are the UKEY2 client, so:
+                //   d2d_client_key = our key  → we encrypt with it
+                //   d2d_server_key = Android's key → we decrypt with it
+                let mut dk = [0u8; 32]; dk.copy_from_slice(&session_keys.d2d_server_key);
+                let mut ek = [0u8; 32]; ek.copy_from_slice(&session_keys.d2d_client_key);
+                let mut rhk = [0u8; 32]; rhk.copy_from_slice(&session_keys.receive_hmac_key);
+                let mut shk = [0u8; 32]; shk.copy_from_slice(&session_keys.send_hmac_key);
+
+                Self {
+                    decrypt_key: dk,  // d2d_server_key — decrypt Android (server) messages
+                    encrypt_key: ek,  // d2d_client_key — encrypt our (client) messages
+                    receive_hmac_key: rhk,
+                    send_hmac_key: shk,
+                }
+            }
+        }
+    }
+
+    /// Get decrypt key for debug logging
+    pub fn get_decrypt_key(&self) -> &[u8; 32] {
+        &self.decrypt_key
+    }
+
+
     /// Wraps a raw payload (e.g. OfflineFrame bytes) into a SecureMessage
     pub fn encrypt_and_sign(&self, payload: &[u8], public_metadata: Option<&[u8]>) -> Result<Vec<u8>> {
         // 1. Generate IV (16 bytes)
@@ -96,13 +154,6 @@ impl SecurityEngine {
 
         let mut final_bytes = Vec::new();
         secure_msg.encode(&mut final_bytes)?;
-
-        // DEBUG: Dump first 64 bytes of encrypted message structure
-        println!("DEBUG: SecureMessage structure:");
-        println!("  -> header_and_body len: {}", hb_bytes.len());
-        println!("  -> signature len: {}", signature.len());
-        println!("  -> final_bytes len: {}", final_bytes.len());
-        println!("  -> first 64 bytes: {}", hex::encode(&final_bytes[..std::cmp::min(64, final_bytes.len())]));
 
         Ok(final_bytes)
     }
